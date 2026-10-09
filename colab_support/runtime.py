@@ -13,6 +13,7 @@ from pathlib import Path
 from .core import BackupWorker, Coordinator, atomic_json
 from .cli import ROOT, preflight, prepare_cookie
 from .diagnostics import safe_diagnostic
+from .merge import finalize_merge, remaining
 
 
 def run(args):
@@ -63,7 +64,7 @@ def run(args):
 
     backup = BackupWorker(events)
     coordinator = Coordinator(args.run_dir, args.drive_root / 'DMRColab/runs' / args.run_dir.name,
-                              backup, submit)
+                              backup, submit, require_merge=True)
     try:
         revision = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],
                                   capture_output=True, text=True, timeout=10)
@@ -153,20 +154,27 @@ def run(args):
                     print(warning, flush=True)
         producer_thread.join()
         renderer.render_executors.shutdown(wait=True)
+        drain_deadline = (drain_started or time.monotonic()) + args.drain_timeout
+        finalize_merge(coordinator, events, drain_deadline,
+                       min_free_gib=args.min_free_gib,
+                       ffmpeg=shutil.which('ffmpeg'), ffprobe=shutil.which('ffprobe'))
+        audit.write(f"{time.time():.3f} merge/{coordinator.manifest['merge']['status']}\n")
         audit.close()
         # 只备份已冻结的白名单事件日志，原有库日志和凭据文件不会进入备份。
         coordinator.pending_backup['audit'] = (None, 'log')
         backup.submit('audit', args.run_dir / 'events.log', coordinator.backup_dir / 'events.log')
         while coordinator.pending_backup:
-            coordinator.handle(events.get(timeout=args.drain_timeout))
+            coordinator.handle(events.get(timeout=remaining(drain_deadline)))
         segments = list(coordinator.manifest['segments'].values())
         coordinator.manifest['counts'] = {
             'source': len(segments), 'danmaku': len(segments),
             'rendered': sum(s['render'] == 'success' for s in segments),
+            'merged': int(coordinator.manifest['merge']['status'] == 'success'),
+            'merged_backed_up': int(coordinator.manifest['merge']['backup']['status'] == 'success'),
             'backed_up_files': sum(v['status'] == 'success' for s in segments for v in s['backup'].values())}
         coordinator.finish()
         while coordinator.pending_backup:
-            coordinator.handle(events.get(timeout=args.drain_timeout))
+            coordinator.handle(events.get(timeout=remaining(drain_deadline)))
         if coordinator.manifest['errors']:
             coordinator.manifest['status'] = 'failed'
         atomic_json(args.run_dir / 'manifest.json', coordinator.manifest)

@@ -1,6 +1,9 @@
 import json
 import queue
+import shutil
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -195,6 +198,125 @@ class BackupAndCookieTests(unittest.TestCase):
             with self.assertRaises(ValueError) as raised:
                 prepare_cookie(source, Path(d) / 'private')
             self.assertNotIn('invalid-shape-secret', str(raised.exception))
+
+
+class MergeTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), '需要 FFmpeg/ffprobe')
+    def test_stream_copy_merge_verifies_duration_and_decode(self):
+        import shutil
+        from colab_support.merge import merge_rendered
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'run'
+            rendered = root / 'rendered'
+            rendered.mkdir(parents=True)
+            for index in (1, 2):
+                target = rendered / f'session-{index}.mp4'
+                subprocess.run([shutil.which('ffmpeg'), '-y', '-v', 'error', '-f', 'lavfi',
+                                '-i', 'testsrc=size=160x120:rate=10',
+                                '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+                                '-t', '1', '-c:a', 'aac',
+                                '-c:v', 'libx264', '-g', '10', '-pix_fmt', 'yuv420p',
+                                '-movflags', '+faststart', str(target)], check=True)
+            manifest = {'segments': {
+                'session-1': {'render': 'success', 'rendered_path': 'rendered/session-1.mp4'},
+                'session-2': {'render': 'success', 'rendered_path': 'rendered/session-2.mp4'},
+            }}
+            result = merge_rendered(root, manifest, time.monotonic() + 60, min_free_gib=0)
+            self.assertEqual(result['status'], 'success')
+            self.assertEqual(result['segment_count'], 2)
+            self.assertTrue((root / 'merged/complete.mp4').is_file())
+            self.assertTrue(result['decode_verified'])
+
+    def test_merge_rejects_gap_and_incomplete_segment(self):
+        from colab_support.merge import MergeError, select_inputs
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'run'
+            (root / 'rendered').mkdir(parents=True)
+            (root / 'rendered/room-1.mp4').write_bytes(b'x')
+            with self.assertRaisesRegex(MergeError, 'merge_incomplete_segments'):
+                select_inputs(root, {'segments': {'room-1': {'render': 'error', 'rendered_path': 'rendered/room-1.mp4'}}})
+            with self.assertRaisesRegex(MergeError, 'merge_segment_gap'):
+                select_inputs(root, {'segments': {
+                    'room-1': {'render': 'success', 'rendered_path': 'rendered/room-1.mp4'},
+                    'room-3': {'render': 'success', 'rendered_path': 'rendered/room-1.mp4'},
+                }})
+
+
+    def test_merge_disk_and_stream_guards_preserve_segments(self):
+        from types import SimpleNamespace
+        from colab_support.merge import MergeError, merge_rendered
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'rendered').mkdir()
+            segments = {}
+            for i in (1, 2):
+                relative = f'rendered/session-{i}.mp4'
+                (root / relative).write_bytes(b'original')
+                segments[f'session-{i}'] = {'render': 'success', 'rendered_path': relative}
+            manifest = {'segments': segments}
+            with patch('colab_support.merge.shutil.disk_usage', return_value=SimpleNamespace(free=0)):
+                with self.assertRaisesRegex(MergeError, 'merge_disk_low'):
+                    merge_rendered(root, manifest, time.monotonic() + 10, min_free_gib=0)
+            with patch('colab_support.merge.probe', side_effect=[(1, ['avc']), (1, ['hevc'])]):
+                with self.assertRaisesRegex(MergeError, 'merge_incompatible_streams'):
+                    merge_rendered(root, manifest, time.monotonic() + 10, min_free_gib=0)
+            self.assertFalse((root / 'merged/complete.mp4').exists())
+            self.assertEqual((root / 'rendered/session-1.mp4').read_bytes(), b'original')
+
+    def test_merge_and_backup_failures_cannot_finish_successfully(self):
+        from colab_support.merge import MergeError, finalize_merge
+        for mode in ('merge_error', 'backup_error', 'upstream_error'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                root, drive = Path(d) / 'run', Path(d) / 'drive'
+                events = queue.Queue()
+                def copy(source, destination):
+                    raise OSError('simulated drive failure')
+                worker = BackupWorker(events, copy=copy, retry_wait=0)
+                try:
+                    c = Coordinator(root, drive, worker, lambda *a: None, require_merge=True)
+                    c.producer_done = True
+                    c.manifest['segments']['session-1'] = {'render': 'success'}
+                    calls = []
+                    def merge(*args, **kwargs):
+                        calls.append(1)
+                        if mode == 'merge_error':
+                            raise MergeError('merge_duration_mismatch')
+                        output = root / 'merged/complete.mp4'
+                        output.parent.mkdir(parents=True)
+                        output.write_bytes(b'merged')
+                        return {'status': 'success', 'path': 'merged/complete.mp4'}
+                    if mode == 'upstream_error':
+                        c.error('render_failed:session-1')
+                    finalize_merge(c, events, time.monotonic() + 5, merge=merge)
+                    c.finish()
+                    while c.pending_backup:
+                        c.handle(events.get(timeout=5))
+                    self.assertEqual(c.manifest['status'], 'failed')
+                    self.assertEqual(json.loads((drive / 'manifest.json').read_text(encoding='utf-8')), c.manifest)
+                    if mode == 'backup_error':
+                        self.assertEqual(c.manifest['merge']['backup']['attempts'], 3)
+                        self.assertEqual(c.manifest['merge']['backup']['status'], 'error')
+                        self.assertTrue((root / 'merged/complete.mp4').exists())
+                    elif mode == 'upstream_error':
+                        self.assertEqual(calls, [])
+                        self.assertEqual(c.manifest['merge']['status'], 'skipped')
+                    else:
+                        self.assertEqual(c.manifest['merge']['status'], 'error')
+                finally:
+                    worker.close()
+
+    def test_merge_backup_timeout_is_bounded(self):
+        from colab_support.merge import MergeError, finalize_merge
+        with tempfile.TemporaryDirectory() as d:
+            c = Coordinator(Path(d), Path(d) / 'drive', CapturingBackup(), lambda *a: None,
+                            require_merge=True)
+            c.producer_done = True
+            with self.assertRaisesRegex(MergeError, 'merge_timeout'):
+                finalize_merge(c, queue.Queue(), time.monotonic() + 0.02,
+                               merge=lambda *a, **kw: {'status': 'success', 'path': 'merged/complete.mp4'})
+            self.assertIn('drain_timeout', c.manifest['errors'])
+            self.assertEqual(c.manifest['merge']['backup']['status'], 'error')
+            self.assertNotEqual(c.manifest['status'], 'success')
 
 
 if __name__ == '__main__':

@@ -116,7 +116,7 @@ class LiveWindow:
 
 
 class Coordinator:
-    def __init__(self, run_dir, backup_dir, backup, render_submit, now=time.monotonic):
+    def __init__(self, run_dir, backup_dir, backup, render_submit, now=time.monotonic, require_merge=False):
         self.run_dir = Path(run_dir)
         self.backup_dir = Path(backup_dir)
         self.backup = backup
@@ -127,10 +127,13 @@ class Coordinator:
         self.pending_render = {}
         self.pending_backup = {}
         self.sequence = 0
-        self.manifest = {'version': 1, 'run_id': self.run_dir.name, 'status': 'running',
+        self.require_merge = require_merge
+        self.manifest = {'version': 2, 'run_id': self.run_dir.name, 'status': 'running',
                          'segments': {}, 'errors': [], 'warnings': [], 'stop_reason': None,
                          'backup_verification': 'mounted_directory_readback_sha256',
                          'backup_dir': str(self.backup_dir)}
+        if require_merge:
+            self.manifest['merge'] = {'status': 'pending', 'backup': {'status': 'pending'}}
 
     def error(self, code):
         if code not in self.manifest['errors']:
@@ -219,11 +222,13 @@ class Coordinator:
             segment['render_wait_seconds'] = started - queued
             if event == 'end':
                 output = Path(data['output']['path'])
-                if not output.is_file() or output.stat().st_size == 0:
+                expected = self.run_dir / 'rendered' / (key + '.mp4')
+                if output.resolve() != expected.resolve() or not output.is_file() or output.stat().st_size == 0:
                     segment['render'] = 'error'
                     self.error('render_output_missing:' + key)
                 else:
                     segment['render'] = 'success'
+                    segment['rendered_path'] = output.relative_to(self.run_dir).as_posix()
                     self._backup(key, 'rendered', output)
             else:
                 segment['render'] = 'error'
@@ -235,6 +240,10 @@ class Coordinator:
             key, kind = item
             if event == 'error':
                 self.error('backup_failed:' + (key or 'metadata') + ':' + kind)
+            if key is None and kind == 'merged':
+                self.manifest['merge']['backup'] = dict(data, status='success' if event == 'end' else 'error')
+                self.checkpoint()
+                return
             if key is None:
                 # 确认检查点不能再次生成检查点，避免无限任务链。
                 atomic_json(self.run_dir / 'manifest.json', self.manifest)
@@ -253,6 +262,10 @@ class Coordinator:
             raise RuntimeError('tasks_not_drained')
         if not self.manifest['segments']:
             self.error('no_segments')
+        if self.require_merge:
+            merged = self.manifest['merge']
+            if merged['status'] != 'success' or merged['backup']['status'] != 'success':
+                self.error('merge_incomplete')
         self.manifest['elapsed_seconds'] = self.now() - self.started
         self.manifest['status'] = 'failed' if self.manifest['errors'] else 'success'
         self.checkpoint()

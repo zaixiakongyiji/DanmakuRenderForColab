@@ -214,7 +214,7 @@ class AdapterTests(unittest.TestCase):
                 renderer.add_task(PipeMessage('colab', 'render', 'newtask', request_id=rid, data={
                     'mode': 'dmrender', 'video': video, 'output': str(output), 'args': render_args}))
             backup = BackupWorker(events, retry_wait=0)
-            coordinator = Coordinator(root, Path(d) / 'drive', backup, submit)
+            coordinator = Coordinator(root, Path(d) / 'drive', backup, submit, require_merge=True)
             video = VideoInfo(path=str(source), dm_file_id=str(ass), group_id='session', segment_id=1,
                               duration=5, ctime=datetime.now(), resolution=(160, 120))
             coordinator.handle({'source': 'downloader', 'event': 'livesegment', 'data': video})
@@ -223,6 +223,9 @@ class AdapterTests(unittest.TestCase):
             while not coordinator.drained() and time.monotonic() < deadline:
                 coordinator.handle(events.get(timeout=15))
             self.assertTrue(coordinator.drained())
+            from colab_support.merge import finalize_merge
+            finalize_merge(coordinator, events, deadline, min_free_gib=0,
+                           ffmpeg=FFMPEG, ffprobe=FFPROBE)
             coordinator.finish()
             while coordinator.pending_backup:
                 coordinator.handle(events.get(timeout=15))
@@ -230,6 +233,10 @@ class AdapterTests(unittest.TestCase):
             backup.close()
             self.assertEqual(coordinator.manifest['status'], 'success')
             self.assertTrue((Path(d) / 'drive/rendered/session-1.mp4').is_file())
+            self.assertTrue((Path(d) / 'drive/merged/complete.mp4').is_file())
+            cloud = json.loads((Path(d) / 'drive/manifest.json').read_text(encoding='utf-8'))
+            self.assertEqual(cloud['merge']['backup']['status'], 'success')
+            self.assertEqual(cloud, coordinator.manifest)
             self.assertEqual(json.loads((Path(d) / 'drive/manifest.json').read_text(encoding='utf-8'))['status'], 'success')
 
     def test_supervisor_timeout_kills_process_group_and_marks_failure(self):

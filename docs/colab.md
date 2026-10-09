@@ -32,11 +32,11 @@ Drive 授权由本人完成。不要把 Cookie 贴进代码、Notebook 文本、
 | `--initial-wait` | 900 秒 | 首次未开播等待上限 |
 | `--offline-grace` | 180 秒 | 连续确认下播等待时间 |
 | `--max-record` | 43200 秒 | 开始直播后的本场时间上限 |
-| `--drain-timeout` | 7200 秒 | 停止录制后渲染、备份收尾上限 |
+| `--drain-timeout` | 7200 秒 | 停止录制后渲染、合并、校验和备份的总收尾上限 |
 | `--min-free-gib` | 10 GiB | 临时盘剩余空间保护阈值 |
 | `--preflight-only` | 关闭 | 仅验证环境，不连接直播间 |
 
-公开 Notebook 的 `ROOM_URL` 留空，必须自行填写后再执行参数单元格。若只录制约一小时，设置 `MAX_RECORD_HOURS = 1`；达到上限后继续完成渲染和备份，因此总运行时间可能超过一小时。不要将填写了个人参数或保存了运行输出的 Notebook 提交到公开仓库。
+公开 Notebook 的 `ROOM_URL` 留空，必须自行填写后再执行参数单元格。若只录制约一小时，设置 `MAX_RECORD_HOURS = 1`；达到上限后继续完成渲染、合并和备份，因此总运行时间可能超过一小时。不要将填写了个人参数或保存了运行输出的 Notebook 提交到公开仓库。
 
 实际入口仅支持 Linux/Colab；状态机测试支持 Windows。Colab 专用依赖在 `colab_support/requirements.txt`，不需要 biliup、其他平台或视频下载工具。
 
@@ -48,7 +48,7 @@ Drive 授权由本人完成。不要把 Cookie 贴进代码、Notebook 文本、
 
 入口直接使用项目默认参数，覆盖云端运行参数，不读取本地 `configs/global.yml`，不扫描 `DMR-*.yml`，不启动宿主、Uploader、Cleaner 或 WebService，不执行在线更新。
 
-视频先写临时磁盘。每个完成分段与其 ASS 同时进入备份队列，渲染通过现有 Render 类串行处理；成品完成后再备份。仅处理关闭写入的分段，使用会话及分段编号去重。取流时选择可用最高画质，优先同画质 AVC，并记录返回的 quality 和 stream_type；低于 10000 时提示检查登录及画质。
+视频先写临时磁盘。每个完成分段与其 ASS 同时进入备份队列，渲染通过现有 Render 类串行处理；成品完成后再备份。录制屏障、全部分段渲染和分段备份完成后，入口按分段编号合并 `rendered/` 成品，检查各段媒体流签名、总时长和全片解码，再将 `merged/complete.mp4` 校验备份。合并失败会保留所有分段并将本场标记为失败，不会静默改用重新编码。仅处理关闭写入的分段，使用会话及分段编号去重。取流时选择可用最高画质，优先同画质 AVC，并记录返回的 quality 和 stream_type；低于 10000 时提示检查登录及画质。
 
 备份目录：
 
@@ -56,7 +56,8 @@ Drive 授权由本人完成。不要把 Cookie 贴进代码、Notebook 文本、
 MyDrive/DMRColab/runs/<运行编号>/
   source/       原片分段
   danmaku/      ASS 文件
-  rendered/     弹幕版 MP4
+  rendered/     弹幕版 MP4 分段
+  merged/       全场合并 MP4（stream copy，经过时长和全片解码校验）
   manifest.json 状态、耗时、计数、校验值、错误和源代码版本
   events.log    白名单事件日志
 ```
@@ -70,6 +71,8 @@ MyDrive/DMRColab/runs/<运行编号>/
 监督进程对整个 worker 进程组设置截止时间，包含被第三方 I/O 或 FFmpeg 卡住的情况。若最终元数据备份失败或强制超时，Drive 清单可能停留在旧状态，以本地清单和退出码为准，不能仅看 Drive 上某份 success 就认定本次完全成功。
 
 本地 `console.log` 提供环境预检及录制阶段信息；清单的 `phase` 和最近 30 条 `diagnostics` 可区分取流、最长约 15 秒的分辨率探测、弹幕就绪和 FFmpeg 启动。FFmpeg 只记录固定错误类别（例如 `http_forbidden`、`network_timeout`、`decoder_missing`）与退出码，不保存原始错误行。备份事件日志也包含这些白名单诊断；备份仅包含白名单事件日志，不包含第三方原始日志、完整配置或签名流 URL。所有原片和成品都保留在临时盘，首版不自动删除，因此长直播应关注磁盘使用。没有跨运行时续录或自动恢复功能；新试跑使用新的运行编号。
+
+合并采用流复制，不再次编码视频。合并前要求分段编号连续、媒体流参数一致，并预留约成品分段总大小的 1.1 倍加最低磁盘余量；分辨率或编码参数变化时会明确失败。合并校验会解码全片，耗时计入两小时收尾上限；时长与解码通过仍需人工检查音画及弹幕同步。
 
 ## 4. 验证与切换
 
@@ -85,7 +88,7 @@ python -m unittest discover -s checks -p "test_colab*.py" -v
 
 1. 核对直播画质、视频和弹幕连接，查看是否出现重连。
 2. 核对原片、ASS、成品数量，播放每个分段，重点检查最后一段及弹幕同步。
-3. 检查本地退出码为 0、清单为 success、Drive 文件可读取；渲染或备份失败必须出现在错误列表。
+3. 检查本地退出码为 0、清单为 success、`merge.status` 和 `merge.backup.status` 均为 success，Drive 中 `merged/complete.mp4` 可读取；渲染或备份失败必须出现在错误列表。
 4. 查看每段实际渲染耗时、排队时间及与视频时长的比例；弹幕条数为 0 需要结合直播内容判断，不能自动等同于正常捕获。
 5. 从 Colab 界面记录运行前后的 CU，Notebook 可保存 `usage.json`；不按显卡型号推算消耗。
 6. 检查完毕、确认需保留的数据均已保存后，手动断开并删除运行时。
