@@ -11,6 +11,16 @@ from urllib.parse import urlparse
 
 from .core import atomic_json
 
+def write_control_ack(path, run_id, status, error=None):
+    if not path or not run_id:
+        return
+    value = {'schema_version': 1, 'run_id': run_id, 'status': status,
+             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    if error:
+        value['error'] = error
+    atomic_json(path, value)
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -104,6 +114,10 @@ def parser():
     p.add_argument('--min-free-gib', type=float, default=10)
     p.add_argument('--preflight-only', action='store_true')
     p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+    p.add_argument('--run-id', help=argparse.SUPPRESS)
+    p.add_argument('--ack-file', type=Path, help=argparse.SUPPRESS)
+    p.add_argument('--auto-run', action='store_true', help='使用专用 CDP 浏览器自动点击一次 Run all')
+    p.add_argument('--cdp-url', help='专用浏览器 loopback CDP 地址')
     return p
 
 
@@ -147,6 +161,8 @@ def supervise(args):
                     if draining_since is None:
                         draining_since = time.monotonic()
                 hard_limit = args.initial_wait + args.max_record + args.drain_timeout + 300
+                if manifest.get('status') == 'draining':
+                    write_control_ack(args.ack_file, args.run_id, 'draining')
                 timed_out = time.monotonic() - started > hard_limit
                 timed_out |= draining_since is not None and time.monotonic() - draining_since > args.drain_timeout
                 force_requested = interrupt_count >= 2 or (args.run_dir / 'FORCE_STOP').exists()
@@ -198,13 +214,18 @@ def main():
         try:
             preflight(args)
         except Exception as error:
+            write_control_ack(args.ack_file, args.run_id, 'failed', type(error).__name__)
             print(str(error))
             return 1
         return 0
+    write_control_ack(args.ack_file, args.run_id, 'running')
     if args.worker:
         from .runtime import run
-        return run(args)
+        result = run(args)
+        write_control_ack(args.ack_file, args.run_id, 'success' if result == 0 else 'failed', None if result == 0 else 'worker_failed')
+        return result
     result = supervise(args)
     manifest = load_manifest(args.run_dir / 'manifest.json')
+    write_control_ack(args.ack_file, args.run_id, 'success' if result == 0 and manifest.get('status') == 'success' else 'failed', None if result == 0 else 'run_failed')
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return result

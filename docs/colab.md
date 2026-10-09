@@ -93,9 +93,29 @@ python -m unittest discover -s checks -p "test_colab*.py" -v
 5. 从 Colab 界面记录运行前后的 CU，Notebook 可保存 `usage.json`；不按显卡型号推算消耗。
 6. 检查完毕、确认需保留的数据均已保存后，手动断开并删除运行时。
 
-云端真实验收完成前，不切换现有正式任务。后续本地自动开播触发、浏览器自动连接和正式迁移单独实施。
+云端流程已经完成基础验收后，可以先使用本节的本地触发器进行小范围试运行；正式任务切换仍需确认触发器与人工运行步骤连续稳定。
 
-## 5. 更新 Notebook 和失败后重试
+## 5. 本地开播触发
+
+云端流程确认可用后，可以在本地运行触发器。它复用现有 B站 LiveAPI，连续两次确认开播后打开公开 Notebook URL，并可将本次直播间链接写入 Google Drive for desktop 的同步目录：
+
+```powershell
+python colab_trigger.py --url https://live.bilibili.com/<直播间号> --drive-sync-root "G:\My Drive"
+```
+
+触发器默认每 60 秒查询一次，连续两次确认开播才触发；连续三次确认下播后为下一场重新武装。网络或 API 查询失败会保持当前任务状态，不直接判定为下播。状态写入本地 .temp/colab-trigger-state.json，同步控制文件写入：
+
+```text
+<Drive同步根目录>/DMRColab/control/trigger.json
+```
+
+Notebook 的参数单元格会优先读取这个私有控制文件；没有 Google Drive for desktop 时，可以省略 --drive-sync-root，打开 Notebook 后手动填写 ROOM_URL。触发器不会把直播间、Cookie 或运行状态写入 Git。
+
+当前实现还提供了单次浏览器自动启动的可选适配：默认仍只打开 Notebook，避免接管日常浏览器。若准备专用浏览器 profile，可用 loopback CDP 启动参数，例如 `--auto-run --cdp-url http://127.0.0.1:9222`；它只在目标 Notebook 页面点击一次“全部运行/Run all”，遇到登录、Drive 授权、运行时选择或页面状态不明确时停止并报告 `needs_attention`，不会自动点击授权、重启或强制中断。首次授权和 Cookie 上传仍由本人完成。
+
+本地触发器会在 `DMRColab/control/trigger.json` 写入 15 分钟有效的请求（不含 Cookie），Notebook 参数单元格校验后认领同一个 `run_id`，并在 `ack.json` 回写 `accepted/running/draining/success/failed`。本地只有读到匹配的回执才把“页面已打开”升级为云端运行状态；打开失败、状态不明或请求过期不会自动重复点击。查询失败会清空连续开播/下播计数。终端状态可通过删除或归档本次控制文件后重新运行触发器来人工复位，不能把成功回执当成下一场任务。
+
+## 6. 更新 Notebook 和失败后重试
 
 升级源码不会自动更新 Drive 中已经保存的 Notebook 单元格。更新后请从 fork 的 `codex/colab-poc` 分支重新打开 `notebooks/colab_record.ipynb`，另存一份私有副本并填写参数。现有运行时目录不会自动拉取更新；确认没有活动任务后再手动 `git pull --ff-only`，或使用新运行时。
 
