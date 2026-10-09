@@ -8,6 +8,7 @@ from DMR.Downloader.stream_downloader import StreamDownloadTask
 from DMR.Downloader.ffmpeg import FFmpegDownloader
 from DMR.utils import uuid
 from .core import LiveWindow
+from .diagnostics import ffmpeg_category, safe_diagnostic
 
 
 class ManagedFFmpeg(FFmpegDownloader):
@@ -17,6 +18,12 @@ class ManagedFFmpeg(FFmpegDownloader):
         self._stop_requested = threading.Event()
         self._process_lock = threading.RLock()
         self.thisfile = None
+        self._reported_categories = set()
+
+    def _diagnostic(self, stage, **details):
+        callback = self.kwargs.get('diagnostic_callback')
+        if callback is not None:
+            callback(stage, **details)
 
     def start_helper(self):
         self.stoped = False
@@ -26,6 +33,7 @@ class ManagedFFmpeg(FFmpegDownloader):
         with self._process_lock:
             if self._stop_requested.is_set():
                 return
+            self._diagnostic('recorder_start')
             self.start_ffmpeg()
         try:
             while True:
@@ -35,12 +43,17 @@ class ManagedFFmpeg(FFmpegDownloader):
                     if self.ffmpeg_proc.poll() is not None and not self.ffmpeg_monitor_proc.is_alive():
                         break
                     continue
+                category = ffmpeg_category(line)
+                if category and category not in self._reported_categories:
+                    self._reported_categories.add(category)
+                    self._diagnostic('ffmpeg_issue', code=category)
                 if 'Opening' in line and "'" in line:
                     name = line.split("'")[1]
                     if not name.startswith(('http:', 'https:')) and Path(name).parent == Path(self.output_dir):
                         if self.thisfile and name != self.thisfile:
                             self.segment_callback(self.thisfile)
                         self.thisfile = name
+            self._diagnostic('recorder_exit', returncode=self.ffmpeg_proc.returncode)
             if self.ffmpeg_proc.returncode != 0 and not self._stop_requested.is_set():
                 raise RuntimeError('ffmpeg_recording_failed')
         finally:
@@ -73,8 +86,12 @@ class SingleSessionDownload(StreamDownloadTask):
         super().__init__(**kwargs)
         self.window = LiveWindow(initial_wait, offline_grace, max_record, time.monotonic())
         self.liveapi.GetStreamURL = self._get_stream_url
+        self.kwargs['diagnostic_callback'] = self._diagnostic
         self.sess_id = uuid(8)
         self.segment_id = 1
+
+    def _diagnostic(self, stage, **details):
+        self._pipeSend('diagnostic', '', data=safe_diagnostic(dict(details, stage=stage)))
 
     def _get_stream_url(self, **options):
         # 每次重连都显式禁用自动登录，避免凭据缺失时落入投稿工具。
@@ -94,6 +111,7 @@ class SingleSessionDownload(StreamDownloadTask):
         reason = 'requested'
         failures = 0
         try:
+            self._diagnostic('awaiting_live')
             while not self.external_stop_event.is_set():
                 status = self.liveapi.Onair()
                 reason_now = self.window.observe(status, time.monotonic())
@@ -110,6 +128,7 @@ class SingleSessionDownload(StreamDownloadTask):
                 except Exception as error:
                     self._pipeSend('liveerror', '', data=type(error).__name__)
                     failures += 1
+                    self._diagnostic('retry', error_type=type(error).__name__, attempt=failures)
                 finally:
                     self.stop_once(wait=True)
                 if self.segment_id > before:

@@ -131,7 +131,7 @@ def supervise(args):
     with lock.open('x', encoding='utf-8') as f:
         f.write(str(os.getpid()))
     process = None
-    interrupted = False
+    interrupt_count = 0
     started = time.monotonic()
     draining_since = None
     stop_path = args.run_dir / 'STOP'
@@ -149,17 +149,19 @@ def supervise(args):
                 hard_limit = args.initial_wait + args.max_record + args.drain_timeout + 300
                 timed_out = time.monotonic() - started > hard_limit
                 timed_out |= draining_since is not None and time.monotonic() - draining_since > args.drain_timeout
-                if timed_out or interrupted:
+                force_requested = interrupt_count >= 2 or (args.run_dir / 'FORCE_STOP').exists()
+                if timed_out or force_requested:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=15)
-                    mark_failed(args.run_dir, 'forced_interrupt' if interrupted else 'drain_timeout')
+                    mark_failed(args.run_dir, 'forced_interrupt' if force_requested else 'drain_timeout')
                     # 超时后不再同步可能已挂起的 Drive；本地状态保留为失败。
                     return 2
                 time.sleep(0.5)
             except KeyboardInterrupt:
-                if stop_path.exists():
-                    interrupted = True
+                # STOP 可由 Notebook 或外部控制创建，不代表监督器已收到过中断。
+                interrupt_count += 1
                 stop_path.touch()
+                print('监督器收到停止信号：正常收尾' if interrupt_count == 1 else '监督器收到再次停止信号：强制结束', flush=True)
         manifest = load_manifest(args.run_dir / 'manifest.json')
         if process.returncode != 0 or manifest.get('status') != 'success':
             try:

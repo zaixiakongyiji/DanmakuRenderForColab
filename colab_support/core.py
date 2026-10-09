@@ -9,6 +9,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .diagnostics import safe_diagnostic
+
 
 def atomic_json(path, value):
     path = Path(path)
@@ -183,6 +185,12 @@ class Coordinator:
                     self.pending_render.pop(rid)
                     self.manifest['segments'][key]['render'] = 'error'
                     self.error('render_submit:' + key)
+            elif event == 'diagnostic':
+                diagnostic = safe_diagnostic(data)
+                self.manifest['phase'] = diagnostic['stage']
+                history = self.manifest.setdefault('diagnostics', [])
+                history.append(diagnostic)
+                del history[:-30]
             elif event == 'quality':
                 self.manifest['quality'] = data
                 if data['quality'] < 10000:

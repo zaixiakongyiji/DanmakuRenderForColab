@@ -149,10 +149,16 @@ class StreamDownloadTask():
         self.segment_start_time = datetime.now()
         self.segment_id += 1
 
+    def _report_stage(self, stage, **details):
+        callback = self.kwargs.get('diagnostic_callback')
+        if callback is not None:
+            callback(stage, **details)
+
     def start_once(self):
         self.stoped = False
         
         # init segment info
+        self._report_stage('room_info')
         self.room_info = retry_safe(self.liveapi.GetRoomInfo)
         self.streamer_info = retry_safe(self.liveapi.GetStreamerInfo)
         if not(self.room_info and self.streamer_info):
@@ -161,9 +167,19 @@ class StreamDownloadTask():
         self.segment_start_time = datetime.now()
         os.makedirs(self.output_dir,exist_ok=True)
         
+        if self.external_stop_event is not None and self.external_stop_event.is_set():
+            return
+        self._report_stage('stream_select')
         stream_url = self.liveapi.GetStreamURL(**self.stream_option)
         stream_request_header = self.liveapi.GetStreamHeader()
+        self._report_stage('probe')
+        probe_started = time.monotonic()
         width, height = FFprobe.get_resolution(stream_url, stream_request_header)
+        self._report_stage('probe_ready' if width and height else 'probe_fallback',
+                           width=width, height=height, elapsed_seconds=time.monotonic() - probe_started)
+        if self.external_stop_event is not None and self.external_stop_event.is_set():
+            self._report_stage('stopping')
+            return
         # 斗鱼和虎牙的直播地址只能用一次，所以要重新获取
         if self.plat == 'douyu' or self.plat == 'huya':
             stream_url = self.liveapi.GetStreamURL(**self.stream_option)
@@ -240,6 +256,8 @@ class StreamDownloadTask():
                     raise RuntimeError('弹幕写入器未就绪')
                 if self.external_stop_event.is_set():
                     return
+                if self.danmaku:
+                    self._report_stage('danmaku_ready')
             with self._video_start_lock:
                 if self.external_stop_event is not None and (self.stoped or self.external_stop_event.is_set()):
                     return

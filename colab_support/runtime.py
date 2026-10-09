@@ -1,5 +1,6 @@
 """运行中的 DMR 适配与有界生命周期。"""
 import copy
+import json
 import logging
 import os
 import queue
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from .core import BackupWorker, Coordinator, atomic_json
 from .cli import ROOT, preflight, prepare_cookie
+from .diagnostics import safe_diagnostic
 
 
 def run(args):
@@ -137,8 +139,12 @@ def run(args):
                 if forced_reason:
                     message['data']['reason'] = forced_reason
                 begin_drain(message['data']['reason'])
+            diagnostic_text = ''
+            if source == 'downloader' and event == 'diagnostic':
+                diagnostic_text = json.dumps(safe_diagnostic(message['data']), ensure_ascii=False)
+                print('录制阶段：', diagnostic_text, flush=True)
             if source != 'backup':
-                audit.write(f'{time.time():.3f} {source}/{event}\n')
+                audit.write(f'{time.time():.3f} {source}/{event} {diagnostic_text}\n')
                 audit.flush()
             coordinator.handle(message)
             if source == 'downloader' and event == 'quality':

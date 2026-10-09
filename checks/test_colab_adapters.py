@@ -131,7 +131,8 @@ class AdapterTests(unittest.TestCase):
         producer.stop_once = lambda wait: order.append(('stopped', wait))
         producer._pipeSend = lambda event, msg, data: order.append((event, data))
         producer.start_helper()
-        self.assertEqual(order[0], ('stopped', True))
+        lifecycle = [item for item in order if item[0] != 'diagnostic']
+        self.assertEqual(lifecycle[0], ('stopped', True))
         self.assertEqual(order[-1][0], 'producer_done')
 
     @unittest.skipUnless(Path(FFMPEG).is_file(), '需要 FFmpeg')
