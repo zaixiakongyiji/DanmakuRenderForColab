@@ -92,6 +92,8 @@ class DanmakuDownloader():
         self.part_start_time = self.start_time
         self.dm_file = self.output.replace(f'%03d','%03d'%self.part)
         self.dmwriter.open(self.dm_file)
+        if self.kwargs.get('ready_event') is not None:
+            self.kwargs['ready_event'].set()
 
         def monitor():
             while not self.stoped:

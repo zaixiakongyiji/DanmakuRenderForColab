@@ -90,7 +90,10 @@ class FFmpegDownloader():
         def ffmpeg_monitor():
             while not self.stoped:
                 if self.ffmpeg_proc.stdout.readable():
-                    line = self.ffmpeg_proc.stdout.readline().strip()
+                    raw_line = self.ffmpeg_proc.stdout.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.strip()
                     if len(line) > 0:
                         self.msg_queue.put(line)
         

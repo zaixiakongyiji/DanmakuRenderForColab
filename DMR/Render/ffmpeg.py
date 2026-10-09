@@ -31,6 +31,8 @@ class RawFFmpegRender(BaseRender):
                     ffmpeg_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT, bufsize=10**8)
 
             self.render_proc.wait()
+            if not self.debug and self.render_proc.stdin is not None:
+                self.render_proc.stdin.close()
             if self.debug:
                 return True, ''
 
@@ -43,7 +45,7 @@ class RawFFmpegRender(BaseRender):
                 if 'video:' in line:
                     info = line
 
-            if info:
+            if info and self.render_proc.returncode == 0:
                 return True, info
             else:
                 return False, log

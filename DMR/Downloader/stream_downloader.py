@@ -52,6 +52,9 @@ class StreamDownloadTask():
         self.advanced_video_args = advanced_video_args if advanced_video_args else {}
         self.advanced_dm_args = advanced_dm_args if advanced_dm_args else {}
         self.stoped = True
+        # Colab 专用协调器以协作事件停止，默认桌面流程不受影响。
+        self.external_stop_event = kwargs.get('external_stop_event')
+        self._video_start_lock = threading.RLock()
 
         # if self.engine not in ['ffmpeg', 'streamlink', 'streamgears', 'pyrequests', 'auto']:
         #     raise NotImplementedError(f'No Downloader Named {self.engine}.')
@@ -191,7 +194,7 @@ class StreamDownloadTask():
 
         if this_engine == 'ffmpeg':
             from .ffmpeg import FFmpegDownloader
-            downloader_class = FFmpegDownloader
+            downloader_class = self.kwargs.get('ffmpeg_downloader_class', FFmpegDownloader)
         elif this_engine == 'streamgears':
             from .streamgears import StreamgearsDownloader
             downloader_class = StreamgearsDownloader
@@ -214,6 +217,8 @@ class StreamDownloadTask():
         self.downloader = None
         self.dmw = None
 
+        self.dm_ready = threading.Event()
+
         def danmaku_thread():
             description = f'{self.taskname}的录播弹幕文件, {self.url}, Powered by DanmakuRender: https://github.com/SmallPeaches/DanmakuRender.'
             danmu_output = join(self.output_dir, f'[正在录制]{self.taskname}-{time.strftime("%Y%m%d-%H%M%S",time.localtime())}-Part%03d.ass')
@@ -225,23 +230,33 @@ class StreamDownloadTask():
                                      height=self.height,
                                      advanced_dm_args=self.advanced_dm_args,
                                      **self.kwargs)
+            if self.external_stop_event is not None:
+                self.dmw.kwargs['ready_event'] = self.dm_ready
             self.dmw.start(self_segment=not self.video)
         
         def video_thread():
-            self.downloader = downloader_class(
-                stream_url=stream_url,
-                header=stream_request_header,
-                output_dir=self.output_dir,
-                output_format=self.output_format,
-                segment=self.segment,
-                url=self.url,
-                taskname=self.taskname,
-                advanced_video_args=self.advanced_video_args,
-                segment_callback=self.segment_callback,
-                stable_callback=self.stable_callback,
-                debug=self.debug,
-                **self.kwargs
-            )
+            if self.external_stop_event is not None:
+                if self.danmaku and not self.dm_ready.wait(15):
+                    raise RuntimeError('弹幕写入器未就绪')
+                if self.external_stop_event.is_set():
+                    return
+            with self._video_start_lock:
+                if self.external_stop_event is not None and (self.stoped or self.external_stop_event.is_set()):
+                    return
+                self.downloader = downloader_class(
+                    stream_url=stream_url,
+                    header=stream_request_header,
+                    output_dir=self.output_dir,
+                    output_format=self.output_format,
+                    segment=self.segment,
+                    url=self.url,
+                    taskname=self.taskname,
+                    advanced_video_args=self.advanced_video_args,
+                    segment_callback=self.segment_callback,
+                    stable_callback=self.stable_callback,
+                    debug=self.debug,
+                    **self.kwargs
+                )
             self.downloader.start()
 
         self.executor = ThreadPoolExecutor(max_workers=int(self.danmaku) + int(self.video))
@@ -249,16 +264,23 @@ class StreamDownloadTask():
         if self.danmaku:
             futures.append(self.executor.submit(danmaku_thread))
         if self.video:
-            futures.append(self.executor.submit(video_thread))
+            self.video_future = self.executor.submit(video_thread)
+            futures.append(self.video_future)
         
+        last_status_check = 0
         while not self.stoped:
+            if self.external_stop_event is not None and self.external_stop_event.is_set():
+                return
             try:
-                for future in as_completed(futures, timeout=60):
+                for future in as_completed(futures, timeout=1 if self.external_stop_event is not None else 60):
                     try:
                         return future.result()
                     except TimeoutError as e:           # 捕获内部的超时，避免死循环
                         raise RuntimeError(f'{self.taskname} 录制异常退出: {e}') from e
             except TimeoutError:
+                if self.external_stop_event is not None and time.monotonic() - last_status_check < 5:
+                    continue
+                last_status_check = time.monotonic()
                 if self.liveapi.Onair() == False:
                     self.logger.debug('LIVE END.')
                     return
@@ -336,13 +358,21 @@ class StreamDownloadTask():
         self.stop_once()
         self._pipeSend('livestop', '录制终止', dtype='str', data=self.sess_id if hasattr(self, 'sess_id') else None)
 
-    def stop_once(self):
+    def stop_once(self, wait=False):
         self.stoped = True
-        if self.video and hasattr(self, 'downloader'):
+        with self._video_start_lock:
+            if self.video and getattr(self, 'downloader', None) is not None:
+                try:
+                    self.downloader.stop()
+                except Exception as e:
+                    self.logger.exception(e)
+        # 先等待最终视频分段回调，再停止弹幕写入器，避免丢失尾段 ASS。
+        if wait and getattr(self, 'video_future', None) is not None:
             try:
-                self.downloader.stop()
+                self.video_future.result()
             except Exception as e:
-                self.logger.exception(e)
+                self.logger.debug(e)
+            self.video_future = None
         if self.danmaku and hasattr(self, 'dmw') and self.dmw:
             try:
                 self.dmw.stop()
@@ -350,6 +380,6 @@ class StreamDownloadTask():
                 self.logger.exception(e)
         try:
             if hasattr(self, 'executor'):
-                self.executor.shutdown(wait=False)
+                self.executor.shutdown(wait=wait)
         except Exception as e:
             self.logger.exception(e)

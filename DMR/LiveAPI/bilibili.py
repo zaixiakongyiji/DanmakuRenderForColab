@@ -51,8 +51,11 @@ class bilibili(BaseAPI):
 
     def get_stream_urls(self,
                         bili_watch_cookies=None,
+                        allow_login=True,
                         **kwargs) -> dict:
         bili_watch_cookies = bili_watch_cookies or '.login_info/.bili_watch_cookies.json'
+        if not allow_login and (bili_watch_cookies.lower() == 'none' or not os.path.isfile(bili_watch_cookies)):
+            raise ValueError('观看 Cookie 文件缺失，自动登录已禁用')
         watch_cookies = {}
         if bili_watch_cookies.lower() != 'none':
             try:
@@ -67,6 +70,8 @@ class bilibili(BaseAPI):
                 watch_cookies = {c['name']: c['value'] for c in cookies['cookie_info']['cookies']}
                 logger.info(f'正在使用 {bili_watch_cookies} 的cookies登录B站.')
             except Exception as e:
+                if not allow_login:
+                    raise ValueError('观看 Cookie 文件无效，自动登录已禁用') from None
                 logger.warning(f'B站观看cookies设置错误:{e}，即将使用无登录模式.')
 
         res = self._get_response()

@@ -1,0 +1,6 @@
+# B 站首版路径依赖；不安装投稿、其他平台或视频下载工具。
+requests
+aiohttp
+easydict
+pyyaml
+brotli
