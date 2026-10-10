@@ -146,6 +146,26 @@ class TriggerTests(unittest.TestCase):
         self.assertFalse(ColabLauncher._click_run_all(page))
         self.assertEqual(button.click.call_count, 1)
 
+    def test_click_authorize_drive_dialog(self):
+        page = MagicMock()
+        drive_btn = MagicMock()
+        drive_btn.count.return_value = 1
+        drive_btn.first.is_visible.return_value = True
+        none_btn = MagicMock()
+        none_btn.count.return_value = 0
+
+        def role(kind, **kwargs):
+            if '连接到 Google 云端硬盘' in str(kwargs.get('name')):
+                return drive_btn
+            return none_btn
+
+        page.get_by_role.side_effect = role
+        self.assertTrue(ColabLauncher._click_authorize_drive(page))
+        drive_btn.first.click.assert_called_once()
+
+        drive_btn.count.return_value = 0
+        self.assertFalse(ColabLauncher._click_authorize_drive(page))
+
     def test_notebook_new_ids_and_failed_preflight_invalidates(self):
         args = (self.root, self.root / 'drive', self.root / 'cookie', 'https://live.bilibili.com/1', 'python')
         first = prepare_session(*args, work_root=self.root / 'work')

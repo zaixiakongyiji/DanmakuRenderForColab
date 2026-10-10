@@ -240,7 +240,60 @@ class ColabLauncher:
                 if page is None:
                     page = browser.contexts[0].new_page()
                     page.goto(self.notebook_url, wait_until="domcontentloaded")
-                return self._click_run_all(page)
+                # 等待“全部运行”按钮渲染可见，避免 SPA 加载时差误判
+                try:
+                    btn = page.get_by_role('button', name=re.compile(r'^(全部运行|Run all)(\s|$)', re.I))
+                    btn.first.wait_for(state="visible", timeout=30000)
+                except Exception:
+                    pass
+                if not self._click_run_all(page):
+                    return False
+                # 点击全部运行后，自动等待并确认 Google 云端硬盘挂载授权
+                self._wait_and_authorize_drive(page, timeout=90)
+                return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _wait_and_authorize_drive(cls, page, timeout=90, interval=2):
+        """点击全部运行后，轮询等待并自动确认 Google 云端硬盘挂载授权。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if cls._click_authorize_drive(page):
+                    time.sleep(3)
+                    return True
+            except Exception:
+                pass
+            time.sleep(interval)
+        return False
+
+    @staticmethod
+    def _click_authorize_drive(page) -> bool:
+        """如果页面存在 Drive 授权确认按钮，点击并返回 True。"""
+        try:
+            btn = page.get_by_role('button', name=re.compile(r'^(连接到 Google 云端硬盘|Connect to Google Drive)$', re.I))
+            if btn.count() >= 1 and btn.first.is_visible():
+                btn.first.click(timeout=5000)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def try_authorize_drive(self) -> bool:
+        """检查并自动点击 Colab 中的 Google 云端硬盘授权弹窗。"""
+        if not self.auto_run or not self.cdp_url:
+            return False
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp(self.cdp_url)
+                pages = [p for context in browser.contexts for p in context.pages]
+                base = self.notebook_url.split('#', 1)[0]
+                page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
+                if page is None:
+                    return False
+                return self._click_authorize_drive(page)
         except Exception:
             return False
 
@@ -332,6 +385,8 @@ class TriggerMonitor:
                 self.state.save(self.state_file)
                 return TriggerResult(self.state.status, run_id=self.state.run_id, error=self.state.last_error)
             if self.state.triggered_at and self.state.ack_status is None:
+                if hasattr(self.launcher, 'try_authorize_drive'):
+                    self.launcher.try_authorize_drive()
                 try:
                     age = (stamp - datetime.fromisoformat(self.state.triggered_at)).total_seconds()
                     if age >= 900:
