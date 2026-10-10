@@ -1,6 +1,7 @@
-# B 站首版路径依赖；不安装投稿、其他平台或视频下载工具。
+# B 站录制、网页投稿和渲染路径依赖；不安装 biliup 登录工具。
 requests
 aiohttp
 easydict
 pyyaml
 brotli
+Pillow

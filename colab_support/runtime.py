@@ -11,12 +11,16 @@ import time
 from pathlib import Path
 
 from .core import BackupWorker, Coordinator, atomic_json
-from .cli import ROOT, preflight, prepare_cookie
+from .cli import ROOT, preflight, prepare_cookie, prepare_upload
 from .diagnostics import safe_diagnostic
 from .merge import finalize_merge, remaining
 
 
 def run(args):
+    # 上游使用 datetime.now()，在开始录制前固定本场时区。
+    os.environ['TZ'] = 'Asia/Shanghai'
+    if hasattr(time, 'tzset'):
+        time.tzset()
     # 原有库可能打印签名流 URL 或完整配置，首版只输出白名单事件日志。
     library_log = logging.getLogger('DMR')
     library_log.handlers = [logging.NullHandler()]
@@ -25,7 +29,7 @@ def run(args):
     try:
         preflight(args)
     except Exception as error:
-        print(str(error), flush=True)  # 预检不调用直播 API，不含 Cookie 内容。
+        print(str(error), flush=True)  # 只允许预检固定错误类别，避免输出第三方原始响应。
         atomic_json(args.run_dir / 'manifest.json', {
             'status': 'failed', 'errors': ['preflight:' + type(error).__name__]})
         return 1
@@ -38,6 +42,12 @@ def run(args):
     events = queue.Queue()
     stop_event = threading.Event()
     cookie = prepare_cookie(args.cookie, args.run_dir / 'private')
+    try:
+        upload_config = prepare_upload(args)
+    except Exception as error:
+        print(str(error), flush=True)
+        atomic_json(args.run_dir / 'manifest.json', {'status': 'failed', 'errors': ['upload_preflight:' + type(error).__name__]})
+        return 1
     with (ROOT / 'DMR/Config/default.yml').open(encoding='utf-8') as f:
         defaults = yaml.safe_load(f)
     os.chdir(args.run_dir)
@@ -63,8 +73,25 @@ def run(args):
             'mode': 'dmrender', 'video': video, 'output': str(output), 'args': render_args}))
 
     backup = BackupWorker(events)
+    posting = None
+    if upload_config.get('enabled'):
+        from .posting import PostingWorker
+        from .upload_config import load_upload_cookie
+        private = args.run_dir / 'private'
+        private.mkdir(exist_ok=True, mode=0o700)
+        frozen_config = private / 'upload.yml'
+        frozen_config.write_text(yaml.safe_dump(upload_config, allow_unicode=True), encoding='utf-8')
+        frozen_cookie = private / 'upload-cookie.json'
+        cookies = load_upload_cookie(args.upload_cookie)
+        atomic_json(frozen_cookie, {'cookie_info': {'cookies': [
+            {'name': k, 'value': v} for k, v in cookies.items()]}})
+        os.chmod(frozen_cookie, 0o600)
+        posting = PostingWorker(events, frozen_cookie, frozen_config, upload_config,
+                                args.run_dir, args.drive_root / 'DMRColab/runs' / args.run_dir.name)
     coordinator = Coordinator(args.run_dir, args.drive_root / 'DMRColab/runs' / args.run_dir.name,
-                              backup, submit, require_merge=True)
+                              backup, submit, require_merge=True,
+                              post_submit=posting.submit if posting else None,
+                              upload_config=upload_config)
     try:
         revision = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],
                                   capture_output=True, text=True, timeout=10)
@@ -72,8 +99,9 @@ def run(args):
     except Exception:
         coordinator.manifest['source_commit'] = 'unknown'
     coordinator.manifest['settings'] = {'room_url': args.url, 'segment_seconds': args.segment,
-                                      'max_record_seconds': args.max_record, 'encoder': 'h264_nvenc',
-                                      'font': 'Noto Sans CJK SC'}
+            'max_record_seconds': args.max_record, 'encoder': 'h264_nvenc',
+                                      'font': 'Noto Sans CJK SC', 'upload_enabled': bool(upload_config.get('enabled')),
+            'upload_min_length': upload_config.get('min_length', 120)}
     coordinator.checkpoint()
     dl = copy.deepcopy(defaults['download_args']['live'])
     dl.update(url=args.url, output_dir=str(args.run_dir / 'source'), segment=args.segment,
@@ -98,6 +126,8 @@ def run(args):
         if drain_started is None:
             drain_started = time.monotonic()
             coordinator.manifest['draining_since'] = time.time()
+            if posting:
+                coordinator.manifest['upload'] = {'status': 'draining_media'}
             coordinator.manifest['status'] = 'draining'
             forced_reason = reason
             if reason not in ('live_end', 'record_limit', 'requested'):
@@ -105,8 +135,12 @@ def run(args):
             coordinator.checkpoint()
         stop_event.set()
 
+    last_checkpoint = time.monotonic()
     try:
-        while not coordinator.drained():
+        while not coordinator.media_drained():
+            if time.monotonic() - last_checkpoint >= 30:
+                coordinator.checkpoint()
+                last_checkpoint = time.monotonic()
             if stop_path.exists():
                 begin_drain('requested')
             free_gib = shutil.disk_usage(args.run_dir).free / 1024**3
@@ -165,16 +199,36 @@ def run(args):
         backup.submit('audit', args.run_dir / 'events.log', coordinator.backup_dir / 'events.log')
         while coordinator.pending_backup:
             coordinator.handle(events.get(timeout=remaining(drain_deadline)))
+        if posting:
+            posting.begin_drain()
+            coordinator.manifest['upload_deadline'] = time.time() + upload_config['drain_timeout']
+            coordinator.manifest['phase'] = 'upload_drain'
+            coordinator.checkpoint()
+            while not coordinator.posting_done() or coordinator.pending_backup:
+                try:
+                    coordinator.handle(events.get(timeout=0.5))
+                except queue.Empty:
+                    if posting.deadline is not None and time.monotonic() > posting.deadline + 15:
+                        coordinator.upload_blocked = True
+                        for rid, key in list(coordinator.pending_upload.items()):
+                            coordinator.handle({'source': 'uploader', 'event': 'unknown',
+                                'request_id': rid, 'data': {'error': 'upload_drain_timeout'}})
+                        coordinator._maybe_post()
+                        break
+            posting.close()
         segments = list(coordinator.manifest['segments'].values())
         coordinator.manifest['counts'] = {
             'source': len(segments), 'danmaku': len(segments),
             'rendered': sum(s['render'] == 'success' for s in segments),
             'merged': int(coordinator.manifest['merge']['status'] == 'success'),
             'merged_backed_up': int(coordinator.manifest['merge']['backup']['status'] == 'success'),
-            'backed_up_files': sum(v['status'] == 'success' for s in segments for v in s['backup'].values())}
+            'backed_up_files': sum(v['status'] == 'success' for s in segments for v in s['backup'].values()),
+            'submitted_parts': sum(s.get('upload', {}).get('status') == 'submitted' for s in segments),
+            'skipped_upload_parts': sum(s.get('upload', {}).get('status') == 'skipped_short' for s in segments)}
         coordinator.finish()
+        final_deadline = time.monotonic() + 120
         while coordinator.pending_backup:
-            coordinator.handle(events.get(timeout=remaining(drain_deadline)))
+            coordinator.handle(events.get(timeout=remaining(final_deadline)))
         if coordinator.manifest['errors']:
             coordinator.manifest['status'] = 'failed'
         atomic_json(args.run_dir / 'manifest.json', coordinator.manifest)
@@ -185,6 +239,8 @@ def run(args):
         coordinator.error('worker_interrupted:' + type(error).__name__)
         coordinator.manifest['status'] = 'failed'
         atomic_json(args.run_dir / 'manifest.json', coordinator.manifest)
+        if posting:
+            posting.close()
         audit.close()
         # 不让 Python 的线程池退出钩子等待不受控第三方线程。
         # 监督器检测非零退出后负责清理同一进程组的遗留子进程。

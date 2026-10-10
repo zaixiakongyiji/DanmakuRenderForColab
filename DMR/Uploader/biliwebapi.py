@@ -24,7 +24,6 @@ from DMR.utils import VideoInfo, replace_keywords
 from concurrent.futures.thread import ThreadPoolExecutor
 import concurrent
 import requests.utils
-import rsa
 from requests.adapters import HTTPAdapter, Retry
 
 from .biliuprs import biliuprs
@@ -39,6 +38,7 @@ class BiliWebApi:
         account:str=None,
         limit=3,
         sort_videos:bool=False,
+        readonly_cookies:bool=False,
         **kwargs,
     ):
         self.cookies = cookies
@@ -49,21 +49,28 @@ class BiliWebApi:
         self.app_key = 'ae57252b0c09105d'
         self.appsec = 'c75875c596a69eb55bd119e74b07cfe3'
         self._session = requests.Session()
-        self._session.mount('https://', HTTPAdapter(max_retries=Retry(total=5)))
+        self._session.mount('https://', HTTPAdapter(max_retries=Retry(total=0 if readonly_cookies else 5)))
         self._session.headers.update({
             'user-agent': "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/63.0.3239.108",
             'referer': "https://www.bilibili.com/",
             'connection': 'keep-alive'
         })
         self._auto_os = None
-        login_info = self.login_by_biliuprs()
+        self.readonly_cookies = readonly_cookies
+        self.chunk_attempts = 3 if readonly_cookies else 5
+        # 云端只读已有凭据，不调用登录工具或续期接口。
+        if readonly_cookies:
+            with open(cookies, encoding='utf-8-sig') as stream:
+                login_info = json.load(stream)
+        else:
+            login_info = self.login_by_biliuprs()
         self.cookies = {}
         for item in login_info['cookie_info']['cookies']:
             self.cookies[item['name']] = item['value']
         self.__bili_jct = self.cookies['bili_jct']
         self._session.cookies = requests.utils.cookiejar_from_dict(self.cookies)
-        self.access_token = login_info['token_info']['access_token']
-        self.refresh_token = login_info['token_info']['refresh_token']
+        self.access_token = login_info.get('token_info', {}).get('access_token')
+        self.refresh_token = login_info.get('token_info', {}).get('refresh_token')
 
         self.videos = None
         self.stoped = False
@@ -79,6 +86,7 @@ class BiliWebApi:
         return hashlib.md5(f"{param}{self.appsec}".encode()).hexdigest()
 
     def get_key(self):
+        import rsa
         url = "https://passport.bilibili.com/x/passport-login/web/key"
         payload = {
             'appkey': f'{self.app_key}',
@@ -292,6 +300,14 @@ class BiliWebApi:
             raise Exception(res)
         return res['data']['url']
 
+    def upload_media(self, filepath, lines='AUTO'):
+        """仅传输媒体，返回远端标识；不创建或修改稿件。"""
+        status, part = self.upload_stream(filepath, os.path.basename(filepath),
+                                        os.path.getsize(filepath), lines=lines, media_only=True)
+        if not status:
+            raise RuntimeError('media_upload_failed')
+        return part
+
     def upload_file(
         self,
         filepath:str,
@@ -317,6 +333,7 @@ class BiliWebApi:
         lines='AUTO',
         videos: 'Data'=None,
         submit_api: Callable[[str], None] = None,
+        media_only=False,
     ):
 
         logger.info(f"{file_name} 开始上传")
@@ -375,6 +392,9 @@ class BiliWebApi:
             return False, '分P上传失败'
         video_part['title'] = video_part['title'][:80]
 
+        if media_only:
+            return True, video_part
+
         if new_videos := self.get_remote_data(videos.bvid):
             videos = new_videos
         videos.append(video_part)  # 添加已经上传的视频
@@ -402,7 +422,9 @@ class BiliWebApi:
         # 开始上传
         parts = []  # 分块信息
         chunks = math.ceil(total_size / chunk_size)  # 获取分块数量
-        total_size = chunks * chunk_size  # 补齐总大小
+        is_file = isinstance(stream_queue, (str, os.PathLike))
+        if not is_file:
+            total_size = chunks * chunk_size  # 保留队列流补齐语义
 
         start = time.perf_counter()
 
@@ -420,50 +442,33 @@ class BiliWebApi:
             chunk_generator = self.queue_reader_generator(stream_queue, chunk_size, total_size)
         
         n = 0
-        st = time.perf_counter()
         max_workers = self.limit
-        semaphore = threading.Semaphore(max_workers)
+        # 有界批次逐个核对结果，失败块不能被丢弃后伪装为成功。
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+            pending = []
             sessions = [copy.deepcopy(self._session) for _ in range(max_workers)]
             for index, chunk in enumerate(chunk_generator):
                 if not chunk:
                     break
-                const_time = time.perf_counter() - st
-                speed = len(chunk) * 8 / 1024 / 1024 / const_time
-                # logger.info(f"{file_name} - chunks-({index+1}/{chunks}) - down - speed: {speed:.2f}Mbps")
                 n += len(chunk)
-                params = {
-                    'uploadId': upload_id,
-                    'chunks': chunks,
-                    'total': total_size,
-                    'chunk': index,
-                    'size': chunk_size,
-                    'partNumber': index + 1,
-                    'start': index * chunk_size,
-                    'end': index * chunk_size + chunk_size
-                }
-                params_clone = params.copy()
-                semaphore.acquire()
-                future = executor.submit(self.upload_chunk_thread, sessions[index % max_workers],
-                                         url, chunk, params_clone, headers, file_name)
-                future.add_done_callback(lambda x: semaphore.release())
-                futures.append(future)
-                st = time.perf_counter()
-
-                for f in list(futures):
-                    if f.done():
-                        futures.remove(f)
-
-                # 等待所有分片上传完成，并按顺序收集结果
-            for future in concurrent.futures.as_completed(futures):
-                pass
-
-            results = [{
-                "partNumber": i + 1,
-                "eTag": "etag"
-            } for i in range(chunks)]
+                params = {'uploadId': upload_id, 'chunks': chunks, 'total': total_size,
+                          'chunk': index, 'size': len(chunk), 'partNumber': index + 1,
+                          'start': index * chunk_size, 'end': index * chunk_size + len(chunk)}
+                pending.append(executor.submit(self.upload_chunk_thread, sessions[index % max_workers],
+                    url, chunk, params, headers, file_name, getattr(self, 'chunk_attempts', 5)))
+                if len(pending) == max_workers:
+                    results = [future.result() for future in pending]
+                    if any(result is None for result in results):
+                        return None
+                    parts.extend(results)
+                    pending.clear()
+            results = [future.result() for future in pending]
+            if any(result is None for result in results):
+                return None
             parts.extend(results)
+        if is_file and (n != total_size or len(parts) != chunks):
+            return None
+        parts.sort(key=lambda part: part['partNumber'])
 
         if n == 0:
             return None
@@ -648,6 +653,7 @@ class BiliWebApi:
                         'cid': video['cid'],
                         'desc': '',
                     })
+                video_data.aid = info.get('aid')
                 return video_data
         except Exception as e:
             logger.error(f'获取远程稿件{bvid}数据失败: {e}')
@@ -659,9 +665,8 @@ class BiliWebApi:
             videos.videos.sort(key=lambda x: x['title'])
         # 不能提交 extra_kwargs 字段，提前处理
         post_data = asdict(videos)
-        if post_data.get('extra_kwargs'):
-            for key, value in post_data.pop('extra_kwargs').items():
-                post_data.setdefault(key, value)
+        for key, value in post_data.pop('extra_kwargs', {}).items():
+            post_data.setdefault(key, value)
 
         # self.__session.get('https://member.bilibili.com/x/geetest/pre/add', timeout=5)
         ret = self.submit_web(post_data, edit=edit)
@@ -670,6 +675,8 @@ class BiliWebApi:
         if ret["code"] == 0:
             return ret
         elif ret["code"] == 10010:
+            if getattr(self, 'readonly_cookies', False):
+                raise RuntimeError('archive_locked')
             self.videos = None
             logger.warning('稿件被锁定或已经删除, 即将提交新稿件')
             raise

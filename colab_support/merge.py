@@ -149,7 +149,7 @@ def merge_rendered(run_dir, manifest, deadline, *, min_free_gib=10,
 def finalize_merge(coordinator, events, deadline, *, min_free_gib=10,
                    ffmpeg='ffmpeg', ffprobe='ffprobe', merge=merge_rendered):
     """在 producer 屏障和所有分段任务完成之后执行，备份沿用同一重试队列。"""
-    if not coordinator.drained():
+    if not coordinator.media_drained():
         raise RuntimeError('tasks_not_drained')
     state = coordinator.manifest['merge']
     if state['status'] != 'pending':

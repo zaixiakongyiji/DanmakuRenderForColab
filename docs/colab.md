@@ -1,122 +1,191 @@
-# Colab 单场录制试跑
+# Colab 单场录制、自动触发与多 P 投稿
 
-本功能将一场 B 站直播的视频、ASS 弹幕、渲染和备份放到 Colab。首版只支持一个标准 B 站直播间链接，不投稿、不自动清理媒体、不自动释放运行时。原来的 `main.py` 和本地配置继续按原方式使用。
+流程：本地检测开播 → 打开指定 Notebook 并点击一次全部运行 → 每小时录制一段 → 渲染、分段备份 → 向同一 B 站稿件追加分 P → 下播后完成媒体归档、投稿收尾和结果汇总。
 
-## 1. 发布与准备
+首版限定一个直播间、一个投稿账号、一个活动运行时。不自动清理媒体或释放运行时；原来的 main.py 和本地配置继续使用原路径。
 
-本地分支为 `codex/colab-poc`，远程 `colab` 指向 `zaixiakongyiji/DanmakuRenderForColab`，`origin` 保留原仓库。使用前确认该远程已有此分支和 Colab 入口。
+## 来源与许可证状态
 
-提交时仅纳入 Colab 新增文件及相关 DMR 适配修改。保留工作区原有修改，不把 Cookie、个人配置、日志、录像或会话文档加入公开仓库。建议提交说明：`feat: 添加 Colab 单场录制渲染与备份流程`。
+本改造基于 [SmallPeaches/DanmakuRender](https://github.com/SmallPeaches/DanmakuRender) 的 v5 分支，直接复用或适配：
 
-发布后，在 Colab 中打开 fork 的 `notebooks/colab_record.ipynb`，选择 GPU 运行时并按顺序执行。Notebook 默认读取该 fork 的 `codex/colab-poc` 分支，已有检出不会自动覆盖；每次结果记录实际 commit SHA。
+- DMR/LiveAPI：直播状态、取流和弹幕协议。
+- DMR/Downloader：StreamDownloadTask、FFmpeg 录制、ASS 写入；SingleSessionDownload 和 ManagedFFmpeg 补充单场生命周期和停止屏障。
+- DMR/Render：现有 Render 和弹幕烧录。
+- DMR/Uploader/biliwebapi.py：网页投稿、稿件查询及 UPOS 上传。新增显式 readonly_cookies 路径、媒体单独上传及全部分块结果检查；桌面默认登录路径保留。
+- DMR/Config/default.yml、DMR/utils：默认参数、PipeMessage 和共享类型。
 
-请在自己的本地配置中确认现有观看 Cookie 文件的位置，然后手动上传一份到 **私有 Drive**：
+colab_support、colab_run.py、colab_trigger.py、colab_upload.py 和 Notebook 负责云端协调、环境检查、备份、事务日志、自动触发和恢复。
+
+截至 2026-10-10，此前检查的上游 v5 根目录及本地版本未发现 LICENSE、COPYING 或 NOTICE 文件；上游 README 包含“本程序仅供研究学习使用！”说明。本改造保留来源和贡献者致谢，不把原代码声明为 MIT、Apache、GPL，也不替原作者重新授权。第三方依赖许可证需分别核对。
+
+## 实现和验收边界
+
+| 能力 | 状态 |
+|---|---|
+| 单场录制、弹幕、中文渲染、Drive 分段备份和合并 | 已实现；用户此前报告云端录制、备份和合并可执行 |
+| 本地 CLI 自动触发、状态锁、请求认领、回执和 Notebook 顺序防护 | 已实现，离线验证；真实浏览器与 Drive 同步链待验收 |
+| B 站首 P 创建、后续追加、投稿事务日志和补传 | 已实现，模拟 API 验证；真实投稿待验收 |
+| 自然下播、真实账号两个 P、审核和公开状态 | 本轮未执行；submitted 不表示审核通过或已公开 |
+| 自动删除媒体、释放运行时、跨运行时续录、多直播间 | 不在本版范围 |
+
+新增行为不能凭离线测试认定已完成云端验收。首次授权、登录凭据和私有配置由用户准备。本地正式任务在验收前继续按原配置运行。
+
+## 1. 源码与观看凭据
+
+分支为 codex/colab-poc，远程 colab 指向 zaixiakongyiji/DanmakuRenderForColab，origin 保留上游。提交时只纳入相关源码、无输出的 Notebook、测试和文档；不纳入个人配置、Cookie、录播、日志或会话文档。Git 提交和推送默认由用户执行；本次发布已由用户明确授权代理执行。
+
+Notebook 默认从 fork 的 codex/colab-poc 拉取，清单记录实际 commit SHA。已有检出不会自动覆盖运行中的代码；更新前结束活动任务，再手动拉取或换新运行时。Drive 中另存的 Notebook 不会随 Git 更新，请重新打开仓库版本并保存私有副本。
+
+手动将已有观看登录 JSON 放到私有 Drive：
 
 ```text
 MyDrive/DMRColab/credentials/bilibili.json
 ```
 
-文件必须包含 `cookie_info.cookies` 列表及非空 `SESSDATA`。Notebook 只复制这份 JSON 的 Cookie 列表到运行时私有目录，不复制 refresh token。不自动登录或刷新 Cookie；缺失、格式错误时在录制前停止。Cookie 能否在云端继续使用需实测；失效时从本地更新私有 Drive 文件。
+必须包含 cookie_info.cookies 列表和非空 SESSDATA。只复制 Cookie 到临时盘 private 目录，不复制 refresh token，不运行 biliup 登录或续期。文件缺失或错误时停止预检。观看凭据失效或实际画质下降需用户更新凭据；清单保留实际 quality 和 stream_type。
 
-Drive 授权由本人完成。不要把 Cookie 贴进代码、Notebook 文本、截图或仓库。程序读取 Cookie 不代表投稿功能被开启。
+## 2. Notebook 与环境
 
-## 2. 参数和预检
+依次执行源码准备、安装依赖、Drive 授权、参数、预检、运行和结果检查。每个准备单元格先使旧会话失效；参数单元格失败或预检失败时不能沿用旧 COMMAND 运行。预检及正式运行都检查环境，成功后才能录制；已运行会话不能再次直接运行。
 
-| 参数 | 默认值 | 作用 |
+依赖位于 colab_support/requirements.txt，无需安装投稿登录 CLI。安装 FFmpeg、Noto Sans CJK SC 和 fontconfig，实测两秒视频、中文 ASS、字幕滤镜与 H.264 NVENC。失败停止，不回退 CPU 编码；字体形状和音画同步还需播放检查。
+
+| 参数 | 默认值 | 含义 |
 |---|---|---|
-| `--url` | 必填，无默认值 | 单个 B 站直播间；在 Notebook 的 `ROOM_URL` 中填写 |
-| `--run-dir` | 必填，Notebook 自动生成 | 临时磁盘的独立运行目录 |
-| `--drive-root` | `/content/drive/MyDrive` | 已挂载的 Drive 根目录 |
-| `--cookie` | Drive 下上述私有路径 | 本地已有登录 JSON 的云端副本 |
-| `--segment` | 300 秒 | 分段时间，实际边界取决于源流关键帧 |
-| `--initial-wait` | 900 秒 | 首次未开播等待上限 |
-| `--offline-grace` | 180 秒 | 连续确认下播等待时间 |
-| `--max-record` | 43200 秒 | 开始直播后的本场时间上限 |
-| `--drain-timeout` | 7200 秒 | 停止录制后渲染、合并、校验和备份的总收尾上限 |
-| `--min-free-gib` | 10 GiB | 临时盘剩余空间保护阈值 |
-| `--preflight-only` | 关闭 | 仅验证环境，不连接直播间 |
+| --url | 必填 | 单个标准 B 站直播间 URL |
+| --segment | 3600 秒 | 每个渲染分段对应一个 P，实际边界依源流关键帧 |
+| --initial-wait | 900 秒 | 初始未开播等待上限 |
+| --offline-grace | 180 秒 | 连续确认下播，查询失败会清空连续计时 |
+| --max-record | 43200 秒 | 本场录制上限 |
+| --drain-timeout | 7200 秒 | 尾段、渲染、合并及媒体备份总预算 |
+| --min-free-gib | 10 GiB | 临时盘保护阈值 |
+| --upload-config | 私有 Drive/config/upload.yml | 省略完整前缀 DMRColab |
+| --upload-cookie | 私有 Drive/credentials/bilibili_upload.json | 投稿凭据，独立于观看 Cookie |
 
-公开 Notebook 的 `ROOM_URL` 留空，必须自行填写后再执行参数单元格。若只录制约一小时，设置 `MAX_RECORD_HOURS = 1`；达到上限后继续完成渲染、合并和备份，因此总运行时间可能超过一小时。不要将填写了个人参数或保存了运行输出的 Notebook 提交到公开仓库。
+短试跑设置 SEGMENT_SECONDS = 300、MAX_RECORD_HOURS = 0.2；只录制一小时设置 MAX_RECORD_HOURS = 1。总运行时间包括后续渲染、合并和投稿，可能超过录制上限。时间统一为 Asia/Shanghai。
 
-实际入口仅支持 Linux/Colab；状态机测试支持 Windows。Colab 专用依赖在 `colab_support/requirements.txt`，不需要 biliup、其他平台或视频下载工具。
+## 3. 私有投稿配置
 
-预检检查系统工具、Noto Sans CJK SC 字体、观看 Cookie 格式，并实际执行两秒合成视频的 ASS 烧录和 H.264 NVENC 编码。任何一步失败都停止，不静默回退 CPU 编码。Notebook 显示预检成品供人工检查中文字形。正式运行会再次做预检，防止运行时或依赖改变后沿用旧结果。
-
-系统 FFmpeg 是否包含可用 NVENC、驱动与编码接口是否匹配，必须由当前实例实测。本地测试不能证明 Colab T4 已通过；若预检失败，按输出检查当前实例环境，不直接开始录制。
-
-## 3. 录制、备份与结束
-
-入口直接使用项目默认参数，覆盖云端运行参数，不读取本地 `configs/global.yml`，不扫描 `DMR-*.yml`，不启动宿主、Uploader、Cleaner 或 WebService，不执行在线更新。
-
-视频先写临时磁盘。每个完成分段与其 ASS 同时进入备份队列，渲染通过现有 Render 类串行处理；成品完成后再备份。录制屏障、全部分段渲染和分段备份完成后，入口按分段编号合并 `rendered/` 成品，检查各段媒体流签名、总时长和全片解码，再将 `merged/complete.mp4` 校验备份。合并失败会保留所有分段并将本场标记为失败，不会静默改用重新编码。仅处理关闭写入的分段，使用会话及分段编号去重。取流时选择可用最高画质，优先同画质 AVC，并记录返回的 quality 和 stream_type；低于 10000 时提示检查登录及画质。
-
-备份目录：
+公开示例 colab_support/upload.example.yml 默认 enabled: false，不含个人账号或直播间。复制到私有 Drive 并填写：
 
 ```text
-MyDrive/DMRColab/runs/<运行编号>/
-  source/       原片分段
-  danmaku/      ASS 文件
-  rendered/     弹幕版 MP4 分段
-  merged/       全场合并 MP4（stream copy，经过时长和全片解码校验）
-  manifest.json 状态、耗时、计数、校验值、错误和源代码版本
-  events.log    白名单事件日志
+MyDrive/DMRColab/config/upload.yml
+MyDrive/DMRColab/credentials/bilibili_upload.json
 ```
 
-备份使用临时名称写入，关闭后重新读取验证大小与 SHA-256，再改成正式名称；最多尝试三次。检查点与备份使用同一串行队列，避免并发覆盖。这里验证的是**挂载目录读回一致性，不是 Drive 服务端持久性保证**，请在 Drive 网页抽查成品。
+投稿 JSON 同样使用 cookie_info.cookies，要求非空 SESSDATA 和 bili_jct，不要求 token_info。观看账号与投稿账号可以不同。
 
-下播状态查询失败会打断“连续下播”计时，不直接判为下播。到达录制上限、收到受控停止或空间不足时，停止接收新录制工作，等待视频线程提交最后一段，再停止弹幕线程，最后等待全部渲染及备份。下载器完成屏障与任务登记共同决定结束，不把队列暂时为空当作完成。
+启用投稿必须明确填写 account（账号备注）、expected_uid（登录身份校验）、tid、copyright、source、title、desc 和 tag。copyright 1 为自制、2 为转载；转载须填写非空来源。分区和转载属性没有推断默认值。配置 enabled: true 后，每场自动执行，不逐场确认。
 
-程序结束后保留运行时。受控停止可在运行目录创建 `STOP` 文件；Notebook 的运行单元格捕获第一次中断会请求受控停止，再次中断通过独立的 `FORCE_STOP` 文件明确请求强制结束。Notebook 启动的监督进程使用独立进程会话，不接收 Notebook 进程组的中断；监督器自身的首次 SIGINT 也只请求正常收尾，不根据 `STOP` 是否存在推断中断次数。强制中断、收尾超时、渲染失败、备份失败、空间不足以及没有录到有效分段都不是成功。
+min_length 默认 120，不能低于 120；更短段标记 skipped_short，仍录制、渲染和备份。limit 为上传分块并发数，默认 3。part_timeout 为单 P 任务超时，drain_timeout 为独立投稿收尾预算，默认都为 7200 秒。录制期间投稿并行；媒体归档完成后进入独立投稿收尾阶段，单 P 超时始终从该 P 开始处理时计算。
 
-监督进程对整个 worker 进程组设置截止时间，包含被第三方 I/O 或 FFmpeg 卡住的情况。若最终元数据备份失败或强制超时，Drive 清单可能停留在旧状态，以本地清单和退出码为准，不能仅看 Drive 上某份 success 就认定本次完全成功。
+标题、简介、标签和来源复用原项目模板，如 {TITLE}、{STREAMER.NAME}、{CTIME.YEAR}。第一个有效分段确定稿件元数据，后续只追加 P1、P2 等分 P；不会用全场合并 MP4 投稿。可选 cover 支持上游的本地文件或图片 URL，配置封面处理失败不会悄悄跳过继续提交。
 
-本地 `console.log` 提供环境预检及录制阶段信息；清单的 `phase` 和最近 30 条 `diagnostics` 可区分取流、最长约 15 秒的分辨率探测、弹幕就绪和 FFmpeg 启动。FFmpeg 只记录固定错误类别（例如 `http_forbidden`、`network_timeout`、`decoder_missing`）与退出码，不保存原始错误行。备份事件日志也包含这些白名单诊断；备份仅包含白名单事件日志，不包含第三方原始日志、完整配置或签名流 URL。所有原片和成品都保留在临时盘，首版不自动删除，因此长直播应关注磁盘使用。没有跨运行时续录或自动恢复功能；新试跑使用新的运行编号。
+启用时在录制前查询登录身份；配置、凭据或身份错误则拒绝启动。运行中失效会停止投稿队列，录制、渲染、备份继续。每场使用临时盘私有配置快照，运行时修改 Drive 配置不会改变已开始的稿件。
 
-合并采用流复制，不再次编码视频。合并前要求分段编号连续、媒体流参数一致，并预留约成品分段总大小的 1.1 倍加最低磁盘余量；分辨率或编码参数变化时会明确失败。合并校验会解码全片，耗时计入两小时收尾上限；时长与解码通过仍需人工检查音画及弹幕同步。
-
-## 4. 验证与切换
-
-离线测试：
+## 4. 备份、投稿事务与完成条件
 
 ```text
+MyDrive/DMRColab/runs/<run_id>/
+  source/             原片分段
+  danmaku/            ASS
+  rendered/           弹幕版分段，每个有效分段作为一个 P
+  merged/complete.mp4 全场归档，仅用于 Drive
+  manifest.json       三项结果、分段状态、校验值、计数和耗时
+  upload.json         投稿事务、远端文件标识、BVID/AID 和状态
+  upload_resume.json  独立补传结果（补传后生成）
+  events.log          白名单事件日志
+```
+
+视频和 ASS 关闭写入后才处理，按 group_id 和 segment_id 去重。原片、ASS 和成品三个备份都成功后才投稿。渲染、备份各一条队列；投稿按数字段号串行执行，编号缺口或失败段阻挡后续追加。
+
+复制先写临时名称，关闭后校验大小和 SHA-256，读回一致才改为正式名称，最多三次。此验证只证明挂载目录可读回一致，不宣称已验证 Drive 服务端持久性。Cookie、上传授权 URL、原始 API 响应不进清单或备份日志；事务中的元数据和身份编号只保存在私有 Drive。
+
+状态区别：
+
+- uploading：媒体传输中。
+- uploaded：媒体上传完成，尚未提交稿件。
+- submitting：本地和 Drive 均已校验保存操作意图，提交正在进行或尚未核对。
+- submitted：有效 BVID 与远端文件顺序核对一致；不表示审核通过或已经公开。
+- failed：明确失败，后续停止；备份文件保留。
+- unknown：可能已提交但无法确认，禁止盲目重发和继续追加。
+- skipped_short：小于本场设定的最短投稿时长。
+
+每个上传块最多三次。全部块成功才合并上传；创建和追加 POST 无自动重试。提交前保存操作编号、内容哈希、远端文件名和预期分 P 序列到本地及 Drive；持久化失败绝不发送 POST。提交响应丢失先核对 BVID；首 P 的 BVID 丢失时有限查询自己的稿件列表，找不到或不能唯一确定则 unknown。稿件锁定、删除、查询失败或外部修改分 P 时不另建稿件。
+
+停止录制后等待下载器完成屏障和所有尾段事件，不靠队列暂空判断结束。媒体阶段完成后进行全场 stream copy 合并，验证媒体参数、时长和全片解码。投稿失败不使媒体归档跳过。若媒体本身失败，合并按原规则报告失败或跳过。
+
+结果分别查看 recording_backup、merge、upload。启用投稿时，至少有一个有效 P 且所有应投 P 都确认提交或按短段规则跳过，投稿才算成功。全短场、失败、unknown 或超时都非零退出。已提交内容不自动撤回。
+
+第一次中断通过 STOP 请求受控停止，仍处理已完成分段；第二次通过 FORCE_STOP 明确强制结束。监督器可终止 worker 及其子进程组；强制结束不宣称成功。程序结束保留运行时和媒体，不继续等待下一场。
+
+最终元数据备份或回执写入失败时，Drive 可能留在旧状态，须结合退出码、本地清单和文件核对；不要只看某份旧 success。
+
+## 5. 本地自动触发和回执
+
+手动打开模式：
+
+```powershell
+python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive"
+```
+
+自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。预先登录、授权并确认 Notebook 使用 GPU 且运行时已连接：
+
+```powershell
+python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive" --notebook-url "<自己的 Notebook URL>" --auto-run --cdp-url http://127.0.0.1:9222
+```
+
+自动浏览器适配依赖本地 playwright，可用 python -m pip install playwright 安装。连接已有专用浏览器，不启动或控制日常浏览器。CDP 只接受 http 的 127.0.0.1、localhost、::1 和显式端口，不接受外部地址。
+
+只操作配置的 Notebook，至多点击一次“全部运行/Run all”。通过可见按钮、状态区和弹窗判断；登录、授权、运行中、运行时未连接或 UI 无法辨别时 needs_attention。不点击授权、不重启运行时、不保活。页面 DOM 可变化，真实浏览器适配必须另行验收；无法识别时宁可交给人工检查。
+
+默认 60 秒轮询，连续两次开播触发；上场已经回执终结且连续三次下播后才能重新武装。查询失败清空连续计数，不把活动任务判为结束。OS 进程锁防止本地重复启动，启动意图先写盘再操作浏览器。状态损坏、旧协议状态或启动结果不明不会自动重置和重新点击。
+
+```text
+<同步根目录>/DMRColab/control/
+  active.json                  当前请求编号
+  runs/<run_id>/request.json    schema_version=2，15 分钟有效
+  runs/<run_id>/claim.json      单运行时认领
+  runs/<run_id>/ack.json        accepted/running/draining/success/failed
+```
+
+同一编号贯穿请求、认领、运行目录、清单和回执，校验版本、有效期及路径。认领仅用于约定的单运行时，不声称提供 Drive 跨机器分布式互斥。手动参数设置每次生成新编号。
+
+认领前由 Notebook 写 accepted 或预检失败，启动后由单一监督器负责回执，避免 worker 与父进程竞争写入。每 30 秒更新心跳，附媒体阶段及投稿状态；超过 5 分钟未更新或 worker 状态长时间停滞则需人工检查，不推断任务结束。15 分钟未收到认领不重复发起。损坏状态需要先人工核实活动任务，再归档本地状态重新开始；不能删除状态作为自动重试策略。
+
+## 6. 按运行编号补传
+
+只补传已关闭任务的校验备份。先确认没有活动运行或其他补传实例：
+
+```bash
+python colab_upload.py --run-id <run_id> --drive-root /content/drive/MyDrive
+```
+
+补传校验原片、ASS、成品三个备份的大小及 SHA-256，把成品恢复到临时盘。绑定原 run_id 和 expected_uid，沿用事务中的首 P 元数据，核对远端序列并跳过已提交内容。媒体传输中断时重新上传该文件，不恢复分块。
+
+unknown 必须先核对远端，无法确认就停止。首 P 编号遗失且自动查询无法找回时，可人工提供候选值，仍核对账号和远端文件序列：
+
+```bash
+python colab_upload.py --run-id <run_id> --reconcile-bvid <BVID>
+```
+
+本地与 Drive 中的投稿事务记录不一致时会停止，不能覆盖本地较新的提交意图。请保留两份记录供人工核对，不通过删除 upload.json 来重试。服务器明确拒绝的稿件提交不自动再试；本版不提供自动修改或撤回已提交 P 的入口。
+
+## 7. 验证
+
+```bash
 python -m unittest discover -s checks -p "test_colab*.py" -v
 ```
 
-真实适配测试需要上述 Colab Python 依赖，以及 PATH 或项目 tools 目录中的 FFmpeg/ffprobe。测试仅在本机回环 HTTP 服务提供合成视频，不连接直播间、不读取真实账号 Cookie。
+2026-10-10 本地最终验证：71 项离线测试全部通过，git diff --check 通过。真实浏览器、Drive 同步、B 站接口与测试账号投稿尚未执行。离线验证后按用户授权发布本次源码改造，发布不代表真实云端验收完成。
 
-首次云端试跑将 `MAX_RECORD_HOURS` 设置为 `0.2`，验证两个以上五分钟分段和限时收尾。随后恢复参数，执行一场一到两小时的自然下播试跑：
+离线测试只使用模拟浏览器、模拟 API、临时目录和合成媒体。覆盖真实 CLI 参数、Cookie 不调用登录工具、首 P 创建与同 BVID 追加、备份门槛、乱序与重复、全短场、分块失败、提交超时核对、未知结果去重、恢复校验、进程锁、请求过期、损坏状态、查询中断、Notebook 顺序与旧变量防护，并保留原录制、渲染、合并和停止回归。
 
-1. 核对直播画质、视频和弹幕连接，查看是否出现重连。
-2. 核对原片、ASS、成品数量，播放每个分段，重点检查最后一段及弹幕同步。
-3. 检查本地退出码为 0、清单为 success、`merge.status` 和 `merge.backup.status` 均为 success，Drive 中 `merged/complete.mp4` 可读取；渲染或备份失败必须出现在错误列表。
-4. 查看每段实际渲染耗时、排队时间及与视频时长的比例；弹幕条数为 0 需要结合直播内容判断，不能自动等同于正常捕获。
-5. 从 Colab 界面记录运行前后的 CU，Notebook 可保存 `usage.json`；不按显卡型号推算消耗。
-6. 检查完毕、确认需保留的数据均已保存后，手动断开并删除运行时。
+真实验收仍需依次执行：
 
-云端流程已经完成基础验收后，可以先使用本节的本地触发器进行小范围试运行；正式任务切换仍需确认触发器与人工运行步骤连续稳定。
+1. 保持 enabled: false，验证本地开播 → Drive 同步 → Notebook 单次自动运行 → 同编号回执 → 完整收尾。
+2. 用指定测试账号和素材，开启投稿，至少两个有效分段；核对 UID、标题、P 顺序、同一 BVID、Drive 清单及 upload.json。
+3. 测试一次受控停止和自然下播，检查尾段、合并、音画与弹幕同步。
+4. 记录渲染耗时/分段时长、积压、磁盘使用，以及 Colab UI 的 CU 消耗。不预先认定 T4 或其他 GPU 性能已验收。
 
-## 5. 本地开播触发
-
-云端流程确认可用后，可以在本地运行触发器。它复用现有 B站 LiveAPI，连续两次确认开播后打开公开 Notebook URL，并可将本次直播间链接写入 Google Drive for desktop 的同步目录：
-
-```powershell
-python colab_trigger.py --url https://live.bilibili.com/<直播间号> --drive-sync-root "G:\My Drive"
-```
-
-触发器默认每 60 秒查询一次，连续两次确认开播才触发；连续三次确认下播后为下一场重新武装。网络或 API 查询失败会保持当前任务状态，不直接判定为下播。状态写入本地 .temp/colab-trigger-state.json，同步控制文件写入：
-
-```text
-<Drive同步根目录>/DMRColab/control/trigger.json
-```
-
-Notebook 的参数单元格会优先读取这个私有控制文件；没有 Google Drive for desktop 时，可以省略 --drive-sync-root，打开 Notebook 后手动填写 ROOM_URL。触发器不会把直播间、Cookie 或运行状态写入 Git。
-
-当前实现还提供了单次浏览器自动启动的可选适配：默认仍只打开 Notebook，避免接管日常浏览器。若准备专用浏览器 profile，可用 loopback CDP 启动参数，例如 `--auto-run --cdp-url http://127.0.0.1:9222`；它只在目标 Notebook 页面点击一次“全部运行/Run all”，遇到登录、Drive 授权、运行时选择或页面状态不明确时停止并报告 `needs_attention`，不会自动点击授权、重启或强制中断。首次授权和 Cookie 上传仍由本人完成。
-
-本地触发器会在 `DMRColab/control/trigger.json` 写入 15 分钟有效的请求（不含 Cookie），Notebook 参数单元格校验后认领同一个 `run_id`，并在 `ack.json` 回写 `accepted/running/draining/success/failed`。本地只有读到匹配的回执才把“页面已打开”升级为云端运行状态；打开失败、状态不明或请求过期不会自动重复点击。查询失败会清空连续开播/下播计数。终端状态可通过删除或归档本次控制文件后重新运行触发器来人工复位，不能把成功回执当成下一场任务。
-
-## 6. 更新 Notebook 和失败后重试
-
-升级源码不会自动更新 Drive 中已经保存的 Notebook 单元格。更新后请从 fork 的 `codex/colab-poc` 分支重新打开 `notebooks/colab_record.ipynb`，另存一份私有副本并填写参数。现有运行时目录不会自动拉取更新；确认没有活动任务后再手动 `git pull --ff-only`，或使用新运行时。
-
-每次重试都重新执行参数单元格，生成新的 `RUN_ID`。开始运行前若已有清单、锁或停止标记，会明确拒绝复用目录，不会把旧的 `failed` 输出误当成新任务结果。保留原目录供检查，不删除原片或失败证据。
+完成后检查 Drive 网页和本地退出码，再由本人断开并删除运行时。未有真实云端证据时，报告仅限本地实现和离线验证。

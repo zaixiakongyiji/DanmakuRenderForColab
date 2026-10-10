@@ -18,12 +18,14 @@ def parser():
     p.add_argument("--notebook-url", default=DEFAULT_NOTEBOOK_URL)
     p.add_argument("--state-file", type=Path, default=Path(".temp/colab-trigger-state.json"))
     p.add_argument("--drive-sync-root", type=Path,
-                   help="Google Drive for desktop 的同步根目录；用于写入 DMRColab/control/trigger.json")
+                   help="Google Drive for desktop 的同步根目录；用于写入 DMRColab/control/runs/<run_id>/request.json")
     p.add_argument("--poll-seconds", type=float, default=60)
     p.add_argument("--live-confirmations", type=int, default=2)
     p.add_argument("--offline-confirmations", type=int, default=3)
     p.add_argument("--no-browser", action="store_true", help="只写控制文件，不打开浏览器")
     p.add_argument("--once", action="store_true", help="触发一次后退出")
+    p.add_argument("--auto-run", action="store_true", help="连接专用 loopback CDP 浏览器并点击一次 Run all")
+    p.add_argument("--cdp-url", help="专用浏览器 loopback CDP 地址")
     return p
 
 
@@ -34,6 +36,12 @@ def main():
         raise ValueError("轮询间隔必须为正数")
     launcher = ColabLauncher(args.notebook_url, args.drive_sync_root, not args.no_browser,
                              auto_run=args.auto_run, cdp_url=args.cdp_url)
+    from colab_support.locks import ProcessLock
+    with ProcessLock(args.state_file.with_suffix('.lock')):
+        return monitor_loop(args, room_url, launcher)
+
+
+def monitor_loop(args, room_url, launcher):
     monitor = TriggerMonitor(room_url, launcher, args.state_file,
                              args.live_confirmations, args.offline_confirmations)
     print("本地 Colab 触发器已启动；查询失败不会判定为下播。", flush=True)

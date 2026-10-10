@@ -1,0 +1,27 @@
+# 复制到私有 Drive 的 DMRColab/config/upload.yml 后填写。公开仓库不保存真实值。
+enabled: false
+account: ""
+expected_uid: null
+min_length: 120
+line: AUTO
+limit: 3
+part_timeout: 7200
+drain_timeout: 7200
+# 必须明确选择：1 为自制，2 为转载；转载须填写 source。
+copyright: null
+source: ""
+tid: null
+title: "[{STREAMER.NAME}/直播回放] {TITLE} {CTIME.YEAR}年{CTIME.MONTH:02d}月{CTIME.DAY:02d}"
+desc: |
+  {STREAMER.NAME} 的直播回放
+  标题：{TITLE}
+  由 DanmakuRender 录制：https://github.com/SmallPeaches/DanmakuRender
+tag: ["直播回放"]
+dynamic: ""
+cover: ""
+no_reprint: 0
+dolby: 0
+hires: 0
+is_only_self: 0
+charging_pay: 0
+open_subtitle: false

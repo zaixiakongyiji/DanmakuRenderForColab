@@ -1,21 +1,23 @@
 """Colab 入口与环境检查。重型 DMR 依赖只在 worker 内导入。"""
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from .core import atomic_json
 
-def write_control_ack(path, run_id, status, error=None):
+def write_control_ack(path, run_id, status, error=None, phase=None, upload=None):
     if not path or not run_id:
         return
-    value = {'schema_version': 1, 'run_id': run_id, 'status': status,
-             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    from .trigger import TRIGGER_SCHEMA_VERSION
+    value = {'schema_version': TRIGGER_SCHEMA_VERSION, 'run_id': run_id, 'status': status,
+             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+             'phase': phase, 'upload': upload}
     if error:
         value['error'] = error
     atomic_json(path, value)
@@ -50,6 +52,14 @@ def prepare_cookie(source, private_dir):
     return destination
 
 
+def prepare_upload(args):
+    from .upload_config import load_upload_config, load_upload_cookie
+    config = load_upload_config(args.upload_config)
+    if config.get('enabled'):
+        load_upload_cookie(args.upload_cookie)
+    return config
+
+
 def run_checked(command, timeout=120):
     result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=timeout)
     if result.returncode:
@@ -68,6 +78,9 @@ def preflight(args):
     if not args.drive_root.is_dir():
         raise RuntimeError('Drive 目录不存在，请先运行 drive.mount 并确认 MyDrive。')
     prepare_cookie(args.cookie, args.run_dir / 'private')
+    from .uploader import prepare_identity
+    upload = prepare_upload(args)
+    prepare_identity(args.upload_cookie, upload)
     font = run_checked(['fc-match', '-f', '%{family}', 'Noto Sans CJK SC'])
     if 'Noto Sans CJK SC' not in font:
         raise RuntimeError('未找到 Noto Sans CJK SC，拒绝静默字体替换。')
@@ -101,12 +114,12 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,中文弹幕预检 Colab
 
 
 def parser():
-    p = argparse.ArgumentParser(description='单场 Colab 录制、弹幕渲染和 Drive 备份，不投稿。')
+    p = argparse.ArgumentParser(description='单场 Colab 录制、渲染、备份及可选多 P 投稿。')
     p.add_argument('--url', required=True, help='本次录制的标准 B 站直播间 URL，无默认直播间。')
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--drive-root', type=Path, default=Path('/content/drive/MyDrive'))
     p.add_argument('--cookie', type=Path)
-    p.add_argument('--segment', type=int, default=300)
+    p.add_argument('--segment', type=int, default=3600)
     p.add_argument('--initial-wait', type=float, default=900)
     p.add_argument('--offline-grace', type=float, default=180)
     p.add_argument('--max-record', type=float, default=43200)
@@ -116,8 +129,8 @@ def parser():
     p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--run-id', help=argparse.SUPPRESS)
     p.add_argument('--ack-file', type=Path, help=argparse.SUPPRESS)
-    p.add_argument('--auto-run', action='store_true', help='使用专用 CDP 浏览器自动点击一次 Run all')
-    p.add_argument('--cdp-url', help='专用浏览器 loopback CDP 地址')
+    p.add_argument('--upload-config', type=Path, help=argparse.SUPPRESS)
+    p.add_argument('--upload-cookie', type=Path, help=argparse.SUPPRESS)
     return p
 
 
@@ -146,6 +159,7 @@ def supervise(args):
         f.write(str(os.getpid()))
     process = None
     interrupt_count = 0
+    last_ack = float('-inf')
     started = time.monotonic()
     draining_since = None
     stop_path = args.run_dir / 'STOP'
@@ -157,14 +171,26 @@ def supervise(args):
         while process.poll() is None:
             try:
                 manifest = load_manifest(args.run_dir / 'manifest.json')
+                now = time.monotonic()
                 if stop_path.exists() or manifest.get('draining_since'):
                     if draining_since is None:
-                        draining_since = time.monotonic()
-                hard_limit = args.initial_wait + args.max_record + args.drain_timeout + 300
-                if manifest.get('status') == 'draining':
-                    write_control_ack(args.ack_file, args.run_id, 'draining')
-                timed_out = time.monotonic() - started > hard_limit
-                timed_out |= draining_since is not None and time.monotonic() - draining_since > args.drain_timeout
+                        draining_since = now
+                upload_timeout = getattr(args, 'upload_drain_timeout', 7200)
+                hard_limit = args.initial_wait + args.max_record + args.drain_timeout + upload_timeout + 300
+                if now - last_ack >= 30:
+                    manifest_file = args.run_dir / 'manifest.json'
+                    stale = manifest_file.exists() and time.time() - manifest_file.stat().st_mtime > 300
+                    write_control_ack(getattr(args, 'ack_file', None), getattr(args, 'run_id', None),
+                        'draining' if draining_since is not None else 'running',
+                        error='worker_state_stale' if stale else None,
+                        phase=manifest.get('phase'), upload=manifest.get('upload', {}).get('status'))
+                    last_ack = now
+                timed_out = now - started > hard_limit
+                if manifest.get('phase') == 'upload_drain':
+                    deadline = manifest.get('upload_deadline')
+                    timed_out |= deadline is not None and time.time() > deadline + 180
+                else:
+                    timed_out |= draining_since is not None and now - draining_since > args.drain_timeout
                 force_requested = interrupt_count >= 2 or (args.run_dir / 'FORCE_STOP').exists()
                 if timed_out or force_requested:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -201,10 +227,15 @@ def main():
     args.run_dir = args.run_dir.resolve()
     args.drive_root = args.drive_root.resolve()
     args.cookie = (args.cookie or args.drive_root / 'DMRColab/credentials/bilibili.json').resolve()
-    parsed = urlparse(args.url)
-    if parsed.scheme != 'https' or parsed.netloc != 'live.bilibili.com' or not parsed.path.strip('/').isdigit():
-        raise ValueError('首版仅支持标准 B 站直播间 URL。')
-    if any(value <= 0 for value in (args.segment, args.initial_wait, args.offline_grace,
+    args.upload_config = (args.upload_config or args.drive_root / 'DMRColab/config/upload.yml').resolve()
+    args.upload_cookie = (args.upload_cookie or args.drive_root / 'DMRColab/credentials/bilibili_upload.json').resolve()
+    from .trigger import validate_room_url, control_paths, RUN_ID_RE
+    args.url = validate_room_url(args.url)
+    if args.run_id and (not RUN_ID_RE.fullmatch(args.run_id) or args.run_id != args.run_dir.name):
+        raise ValueError('run_id_directory_mismatch')
+    if args.ack_file and (not args.run_id or args.ack_file.resolve() != control_paths(args.drive_root, args.run_id)[2].resolve()):
+        raise ValueError('ack_path_invalid')
+    if any(not math.isfinite(value) or value <= 0 for value in (args.segment, args.initial_wait, args.offline_grace,
                                     args.max_record, args.drain_timeout, args.min_free_gib)):
         raise ValueError('时间、分段和空间限制必须为正数。')
     if args.drive_root == args.run_dir or args.run_dir.is_relative_to(args.drive_root):
@@ -218,13 +249,23 @@ def main():
             print(str(error))
             return 1
         return 0
-    write_control_ack(args.ack_file, args.run_id, 'running')
     if args.worker:
         from .runtime import run
         result = run(args)
-        write_control_ack(args.ack_file, args.run_id, 'success' if result == 0 else 'failed', None if result == 0 else 'worker_failed')
         return result
-    result = supervise(args)
+    try:
+        args.upload_drain_timeout = prepare_upload(args).get('drain_timeout', 7200)
+    except Exception:
+        write_control_ack(args.ack_file, args.run_id, 'failed', 'upload_config_invalid')
+        raise
+    from .locks import ProcessLock
+    with ProcessLock(args.run_dir.parent / 'colab-runtime.lock'):
+        write_control_ack(args.ack_file, args.run_id, 'running')
+        try:
+            result = supervise(args)
+        except BaseException:
+            write_control_ack(args.ack_file, args.run_id, 'failed', 'supervisor_failed')
+            raise
     manifest = load_manifest(args.run_dir / 'manifest.json')
     write_control_ack(args.ack_file, args.run_id, 'success' if result == 0 and manifest.get('status') == 'success' else 'failed', None if result == 0 else 'run_failed')
     print(json.dumps(manifest, ensure_ascii=False, indent=2))

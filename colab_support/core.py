@@ -116,7 +116,8 @@ class LiveWindow:
 
 
 class Coordinator:
-    def __init__(self, run_dir, backup_dir, backup, render_submit, now=time.monotonic, require_merge=False):
+    def __init__(self, run_dir, backup_dir, backup, render_submit, now=time.monotonic, require_merge=False,
+                 post_submit=None, upload_config=None):
         self.run_dir = Path(run_dir)
         self.backup_dir = Path(backup_dir)
         self.backup = backup
@@ -128,6 +129,10 @@ class Coordinator:
         self.pending_backup = {}
         self.sequence = 0
         self.require_merge = require_merge
+        self.post_submit = post_submit
+        self.upload_config = upload_config or {'enabled': False}
+        self.pending_upload = {}
+        self.upload_blocked = False
         self.manifest = {'version': 2, 'run_id': self.run_dir.name, 'status': 'running',
                          'segments': {}, 'errors': [], 'warnings': [], 'stop_reason': None,
                          'backup_verification': 'mounted_directory_readback_sha256',
@@ -176,7 +181,12 @@ class Coordinator:
                         raise ValueError('invalid_segment_file')
                 self.manifest['segments'][key] = {
                     'source': video.name, 'danmaku': ass.name, 'duration': data['duration'],
-                    'render': 'pending', 'backup': {}, 'render_queued_at': self.now(),
+                    'render': 'pending', 'backup': {}, 'upload': {'status': 'pending'},
+                    'render_queued_at': self.now(), 'title': data.get('title', ''),
+                    'ctime': data.get('ctime').isoformat() if hasattr(data.get('ctime'), 'isoformat') else data.get('ctime'),
+                    'streamer': {k: v for k, v in (data.get('streamer') or {}).items() if k in ('name', 'url')},
+                    'group_id': data['group_id'],
+                    'segment_id': data['segment_id'],
                     'danmaku_dialogues': sum(line.startswith('Dialogue:') for line in ass.read_text(encoding='utf-8-sig').splitlines())}
                 self._backup(key, 'source', video)
                 self._backup(key, 'danmaku', ass)
@@ -233,6 +243,23 @@ class Coordinator:
             else:
                 segment['render'] = 'error'
                 self.error('render_failed:' + key)
+        elif source == 'uploader' and event == 'progress':
+            key = self.pending_upload.get(request_id)
+            if key is None:
+                return
+            self.manifest['segments'][key]['upload'] = dict(data)
+            self.manifest['upload'] = {'status': data['status']}
+        elif source == 'uploader' and event in ('end', 'error', 'unknown'):
+            key = self.pending_upload.pop(request_id, None)
+            if key is None:
+                return
+            segment = self.manifest['segments'][key]
+            if event == 'end':
+                segment['upload'] = dict(data, status='submitted')
+            else:
+                segment['upload'] = dict(data, status='unknown' if event == 'unknown' else 'failed')
+                self.upload_blocked = True
+                self.manifest.setdefault('upload_errors', []).append('upload_' + event + ':' + key)
         elif source == 'backup' and event in ('end', 'error'):
             item = self.pending_backup.pop(request_id, None)
             if item is None:
@@ -252,10 +279,78 @@ class Coordinator:
                 data, status='success' if event == 'end' else 'error')
         else:
             return
+        self._maybe_post()
         self.checkpoint()
 
-    def drained(self):
+    def _maybe_post(self):
+        if not self.post_submit or not self.upload_config.get('enabled') or self.pending_upload:
+            return
+        segments = sorted(self.manifest['segments'].items(), key=lambda item: int(item[1]['segment_id']))
+        sequence = [int(s['segment_id']) for _, s in segments]
+        if sequence != list(range(1, len(segments) + 1)) or len({s['group_id'] for _, s in segments}) > 1:
+            if self.producer_done:
+                self.upload_blocked = True
+                if 'upload_segment_gap' not in self.manifest.setdefault('upload_errors', []):
+                    self.manifest['upload_errors'].append('upload_segment_gap')
+                for _, segment in segments:
+                    if segment['upload']['status'] == 'pending':
+                        segment['upload'].update(status='failed', error='upload_segment_gap')
+            return
+        submitted = 0
+        for key, segment in segments:
+            upload = segment['upload']
+            if upload['status'] == 'submitted':
+                submitted += 1
+                continue
+            if upload['status'] == 'skipped_short':
+                continue
+            if upload['status'] in {'failed', 'unknown'}:
+                self.upload_blocked = True
+                continue
+            if upload['status'] != 'pending':
+                return
+            ready = segment.get('render') == 'success' and all(
+                segment.get('backup', {}).get(kind, {}).get('status') == 'success'
+                for kind in ('source', 'danmaku', 'rendered'))
+            if not ready:
+                if self.upload_blocked:
+                    upload.update(status='failed', error='upload_previous_part_blocked')
+                    continue
+                if self.producer_done and not self.pending_render and not any(
+                        item[0] == key for item in self.pending_backup.values()):
+                    upload.update(status='failed', error='upload_media_incomplete')
+                    self.upload_blocked = True
+                    continue
+                return
+            if segment['duration'] < self.upload_config.get('min_length', 120):
+                upload.update(status='skipped_short', reason='below_min_length')
+                continue
+            if self.upload_blocked:
+                upload.update(status='failed', error='upload_previous_part_blocked')
+                continue
+            request_id = uuid.uuid4().hex
+            self.pending_upload[request_id] = key
+            upload.update(status='uploading', part_index=submitted + 1)
+            try:
+                self.post_submit(request_id, key, self.run_dir / segment['rendered_path'], segment, submitted + 1)
+            except Exception:
+                self.pending_upload.pop(request_id)
+                upload.update(status='failed', error='upload_dispatch_failed')
+                self.upload_blocked = True
+            return
+
+    def media_drained(self):
         return self.producer_done and not self.pending_render and not self.pending_backup
+
+    def posting_done(self):
+        if not self.upload_config.get('enabled'):
+            return True
+        self._maybe_post()
+        return not self.pending_upload and all(s['upload']['status'] in
+            {'submitted', 'skipped_short', 'failed', 'unknown'} for s in self.manifest['segments'].values())
+
+    def drained(self):
+        return self.media_drained() and self.posting_done()
 
     def finish(self):
         if not self.drained():
@@ -266,6 +361,19 @@ class Coordinator:
             merged = self.manifest['merge']
             if merged['status'] != 'success' or merged['backup']['status'] != 'success':
                 self.error('merge_incomplete')
+        media_errors = [code for code in self.manifest['errors'] if not code.startswith(('merge_', 'upload_'))]
+        self.manifest['recording_backup'] = {'status': 'failed' if media_errors else 'success'}
+        if self.upload_config.get('enabled'):
+            statuses = [s['upload']['status'] for s in self.manifest['segments'].values()]
+            complete = bool(statuses) and 'submitted' in statuses and all(
+                status in {'submitted', 'skipped_short'} for status in statuses)
+            if not complete:
+                self.error('upload_incomplete')
+            self.manifest['upload'] = {'status': 'success' if complete else 'failed',
+                'submitted_parts': statuses.count('submitted'),
+                'skipped_parts': statuses.count('skipped_short')}
+        else:
+            self.manifest['upload'] = {'status': 'disabled'}
         self.manifest['elapsed_seconds'] = self.now() - self.started
         self.manifest['status'] = 'failed' if self.manifest['errors'] else 'success'
         self.checkpoint()

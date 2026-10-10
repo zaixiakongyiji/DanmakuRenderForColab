@@ -247,7 +247,7 @@ class AdapterTests(unittest.TestCase):
             process = MagicMock(pid=12345)
             # 两次循环后超时，finally 看到已退出。
             process.poll.side_effect = [None, None, 2]
-            clock = iter([0, 0, 0, 0, 2, 2])
+            clock = iter([0, 0, 2])
             with patch('colab_support.cli.sys.platform', 'linux'), \
                  patch('colab_support.cli.subprocess.Popen', return_value=process), \
                  patch('colab_support.cli.time.monotonic', side_effect=lambda: next(clock)), \
