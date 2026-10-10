@@ -17,11 +17,30 @@ from colab_support.trigger import atomic_json, validate_cdp, validate_room_url
 
 ROOT = Path(__file__).resolve().parent
 SETTINGS = ROOT / '.temp/colab-monitor-settings.json'
+INACTIVE_TRIGGER_STATUSES = {
+    'unknown', 'offline', 'probe_unavailable', 'ended', 'success', 'failed', 'needs_attention'
+}
 
 
 def prompt(label, default=''):
     value = input(f'{label}' + (f' [{default}]' if default else '') + ': ').strip().strip('"')
     return value or default
+
+
+def reset_trigger_state_if_inactive(old_task_config, new_task_config, state_file):
+    if not old_task_config or old_task_config == new_task_config or not state_file.exists():
+        return False
+    try:
+        state_data = json.loads(state_file.read_text(encoding='utf-8'))
+        if not isinstance(state_data, dict):
+            return False
+        if (not state_data.get('triggered') and not state_data.get('run_id')
+                and state_data.get('status') in INACTIVE_TRIGGER_STATUSES):
+            state_file.unlink(missing_ok=True)
+            return True
+    except (OSError, TypeError, ValueError):
+        pass
+    return False
 
 
 def task_room(path):
@@ -97,6 +116,9 @@ def setup(old=None):
     }
     validate_settings(value)
     atomic_json(SETTINGS, value)
+    state_file = ROOT / '.temp/colab-trigger-state.json'
+    if reset_trigger_state_if_inactive(old.get('task_config'), value['task_config'], state_file):
+        print('已切换任务配置，已自动重置监控状态。')
     print('设置已保存到 .temp/colab-monitor-settings.json。')
     return value
 

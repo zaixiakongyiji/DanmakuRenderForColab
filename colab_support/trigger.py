@@ -153,8 +153,36 @@ class TriggerState:
             return cls(room_url=room_url)
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            if payload.get('room_url') != room_url or payload.get('schema_version') != TRIGGER_SCHEMA_VERSION:
+            if payload.get('schema_version') != TRIGGER_SCHEMA_VERSION:
                 raise ValueError()
+            valid_statuses = {'unknown', 'offline', 'probe_unavailable', 'live', 'dispatching',
+                    'needs_attention', 'opened', 'accepted', 'running', 'draining', 'success', 'failed', 'ended'}
+            if payload.get('room_url') != room_url:
+                is_active = payload.get('triggered') or payload.get('status') in {
+                    'dispatching', 'opened', 'accepted', 'running', 'draining'
+                }
+                if is_active:
+                    if (payload.get('status') not in valid_statuses
+                            or type(payload.get('triggered')) is not bool
+                            or any(type(payload.get(k)) is not int or payload[k] < 0
+                                   for k in ('live_streak', 'offline_streak'))):
+                        raise ValueError()
+                    if payload.get('run_id') is not None and (
+                            not isinstance(payload['run_id'], str)
+                            or not RUN_ID_RE.fullmatch(payload['run_id'])):
+                        raise ValueError()
+                    allowed = {field for field in cls.__dataclass_fields__}
+                    state = cls(**{key: value for key, value in payload.items() if key in allowed})
+                    if state.triggered and not state.run_id:
+                        raise ValueError()
+                    if state.run_id and (
+                            not state.triggered_at
+                            or datetime.fromisoformat(state.triggered_at).tzinfo is None):
+                        raise ValueError()
+                    state.room_url = room_url
+                    state.status, state.last_error = 'needs_attention', 'active_run_conflict'
+                    return state
+                return cls(room_url=room_url)
             if type(payload.get('triggered')) is not bool or any(type(payload.get(k)) is not int or payload[k] < 0
                     for k in ('live_streak', 'offline_streak')):
                 raise ValueError()
@@ -162,8 +190,7 @@ class TriggerState:
                 raise ValueError()
             allowed = {field for field in cls.__dataclass_fields__}
             state = cls(**{key: value for key, value in payload.items() if key in allowed})
-            if state.status not in {'unknown', 'offline', 'probe_unavailable', 'live', 'dispatching',
-                    'needs_attention', 'opened', 'accepted', 'running', 'draining', 'success', 'failed', 'ended'}:
+            if state.status not in valid_statuses:
                 raise ValueError()
             if state.triggered and not state.run_id:
                 raise ValueError()
@@ -345,9 +372,26 @@ class ColabLauncher:
         if connected.count() == 1 and connected.is_visible():
             return True
         connect = page.get_by_role('button', name=re.compile(
-            r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|Connect to hosted runtime)$', re.I))
+            r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|Connect to hosted runtime)(\s.*)?$', re.I))
         if connect.count() == 1 and connect.is_visible() and connect.is_enabled():
             return False
+        try:
+            connect_btn = page.locator('colab-connect-button #connect, #connect')
+            if connect_btn.count() == 1 and connect_btn.first.is_visible():
+                text = connect_btn.first.inner_text() or ''
+                tooltip = connect_btn.first.get_attribute('tooltiptext') or ''
+                for label in (text, tooltip):
+                    label = label.strip()
+                    if re.search(
+                            r'^(已连接|Connected)(\s|$)|RAM.*(磁盘|Disk)|'
+                            r'显示.*(RAM|内存).*使用|Show.*RAM.*usage', label, re.I):
+                        return True
+                    if re.search(
+                            r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|'
+                            r'Connect to hosted runtime)(\s.*)?$', label, re.I):
+                        return False
+        except Exception:
+            pass
         return None
 
 

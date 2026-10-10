@@ -193,6 +193,44 @@ class TriggerTests(unittest.TestCase):
                 self.assertFalse(cell['outputs'])
                 self.assertIsNone(cell['execution_count'])
 
+    def test_room_url_switch_gracefully_resets_or_conflicts(self):
+        from colab_support.trigger import TriggerState
+        state_file = self.root / 'switch_state.json'
+        old_state = TriggerState(room_url='https://live.bilibili.com/1', status='offline')
+        old_state.save(state_file)
+        new_state = TriggerState.load(state_file, 'https://live.bilibili.com/2')
+        self.assertEqual(new_state.room_url, 'https://live.bilibili.com/2')
+        self.assertEqual(new_state.status, 'unknown')
+        self.assertIsNone(new_state.last_error)
+
+        active_state = TriggerState(room_url='https://live.bilibili.com/1', status='running',
+                                    triggered=True, run_id='20261010-000000-00000000',
+                                    triggered_at='2026-10-10T00:00:00+00:00')
+        active_state.save(state_file)
+        conflict_state = TriggerState.load(state_file, 'https://live.bilibili.com/2')
+        self.assertEqual(conflict_state.status, 'needs_attention')
+        self.assertEqual(conflict_state.last_error, 'active_run_conflict')
+        self.assertTrue(conflict_state.triggered)
+        self.assertEqual(conflict_state.run_id, '20261010-000000-00000000')
+
+    def test_task_switch_preserves_uncertain_run_state(self):
+        from colab_monitor import reset_trigger_state_if_inactive
+        state_file = self.root / 'switch_state.json'
+        state_file.write_text(json.dumps({
+            'triggered': False, 'status': 'needs_attention',
+            'run_id': '20261010-000000-00000000', 'last_error': 'launch_state_unknown'
+        }), encoding='utf-8')
+        self.assertFalse(reset_trigger_state_if_inactive('old.yml', 'new.yml', state_file))
+        self.assertTrue(state_file.exists())
+
+        state_file.write_text(json.dumps({'triggered': False, 'status': 'ended'}), encoding='utf-8')
+        self.assertTrue(reset_trigger_state_if_inactive('old.yml', 'new.yml', state_file))
+        self.assertFalse(state_file.exists())
+
+        state_file.write_text('[]', encoding='utf-8')
+        self.assertFalse(reset_trigger_state_if_inactive('old.yml', 'new.yml', state_file))
+        self.assertTrue(state_file.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

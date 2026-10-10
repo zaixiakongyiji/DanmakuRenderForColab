@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -218,6 +219,33 @@ class BrowserReleaseTests(unittest.TestCase):
         self.assertTrue(ColabLauncher._click_run_all(page))
         button.click.assert_called_once()
         self.assertFalse(ColabLauncher._connection_state(page))
+
+    def test_connection_state_matches_hardware_suffixes(self):
+        for label in ('连接', 'Connect', '连接 GPU', 'Connect GPU', '连接 T4', '连接到托管运行时'):
+            match = re.search(r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|Connect to hosted runtime)(\s.*)?$', label, re.I)
+            self.assertIsNotNone(match, f'Failed to match: {label}')
+
+    def test_connection_state_falls_back_to_component_locator(self):
+        page = MagicMock()
+        page.get_by_role.return_value.count.return_value = 0
+        btn = MagicMock()
+        btn.count.return_value = 1
+        btn.first.is_visible.return_value = True
+        btn.first.inner_text.return_value = '连接 GPU'
+        btn.first.get_attribute.return_value = '连接到托管运行时'
+        page.locator.return_value = btn
+        self.assertFalse(ColabLauncher._connection_state(page))
+
+    def test_component_locator_preserves_connected_state(self):
+        page = MagicMock()
+        page.get_by_role.return_value.count.return_value = 0
+        btn = MagicMock()
+        btn.count.return_value = 1
+        btn.first.is_visible.return_value = True
+        btn.first.inner_text.return_value = 'Connected'
+        btn.first.get_attribute.return_value = ''
+        page.locator.return_value = btn
+        self.assertTrue(ColabLauncher._connection_state(page))
 
     def test_unknown_page_busy_dialog_and_login_fail_closed(self):
         for options in ({'status': ('Connecting',)}, {'status': ('Running',)}, {'dialog': True}):
