@@ -156,7 +156,7 @@ class ColabBiliUploader:
         journal.save()
         return True
 
-    def upload_part(self, path, segment, index, journal, key, candidate=None):
+    def upload_part(self, path, segment, index, journal, key, candidate=None, *, part_title=None):
         started = time.monotonic()
         self.check_identity()
         size, checksum = digest(path)
@@ -211,7 +211,8 @@ class ColabBiliUploader:
             current.update(status='uploaded', filename=filename)
             journal.save()
         self.check_identity()
-        new_part = {'filename': current['filename'], 'title': 'P' + str(index), 'desc': ''}
+        new_part = {'filename': current['filename'],
+                    'title': part_title if part_title is not None else 'P' + str(index), 'desc': ''}
         if remote:
             payload = asdict(remote)
             payload.pop('extra_kwargs', None)

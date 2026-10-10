@@ -64,6 +64,85 @@ def probe(path, ffprobe, deadline):
     return duration, signature
 
 
+def probe_hwaccel_cuda(ffmpeg, target, deadline):
+    """探测 FFmpeg 与当前环境是否支持 CUDA 硬件解码加速。"""
+    try:
+        media_command([ffmpeg, '-nostdin', '-hide_banner', '-v', 'error',
+                       '-hwaccel', 'cuda', '-i', str(target),
+                       '-frames:v', '1', '-f', 'null', '-'], deadline)
+        return True
+    except MergeError as error:
+        if str(error) == 'merge_timeout':
+            raise
+        return False
+
+
+def compute_check_windows(actual_duration, segment_durations, window_seconds=30.0):
+    """计算需要重点校验的时间窗口 [start, length]，合并重叠区间。"""
+    if actual_duration <= window_seconds * 2:
+        return [(0.0, actual_duration)]
+    half = window_seconds / 2.0
+    points = [0.0]
+    cumulative = 0.0
+    for dur in segment_durations[:-1]:
+        cumulative += dur
+        points.append(cumulative)
+    points.append(actual_duration)
+
+    raw_windows = [(0.0, min(window_seconds, actual_duration))]
+    for boundary in points[1:-1]:
+        start = max(0.0, boundary - half)
+        end = min(actual_duration, boundary + half)
+        raw_windows.append((start, end - start))
+    tail_start = max(0.0, actual_duration - window_seconds)
+    raw_windows.append((tail_start, actual_duration - tail_start))
+
+    intervals = [[s, s + length] for s, length in raw_windows]
+    intervals.sort()
+
+    merged = []
+    for cur in intervals:
+        if not merged:
+            merged.append(cur)
+        else:
+            prev = merged[-1]
+            if cur[0] <= prev[1] + 1.0:
+                prev[1] = max(prev[1], cur[1])
+            else:
+                merged.append(cur)
+    return [(round(s, 3), round(e - s, 3)) for s, e in merged]
+
+
+def verify_decode(ffmpeg, partial, actual_duration, segment_durations, deadline):
+    """支持 CUDA 硬件加速探测与长视频接缝抽样校验的健全性解码。"""
+    use_cuda = probe_hwaccel_cuda(ffmpeg, partial, deadline)
+    if use_cuda:
+        # CUDA 硬解可用：直接高速全片硬解校验
+        media_command([ffmpeg, '-nostdin', '-hide_banner', '-v', 'error', '-xerror',
+                       '-hwaccel', 'cuda', '-i', str(partial),
+                       '-map', '0:v', '-map', '0:a?', '-f', 'null', '-'], deadline)
+        return 'cuda_full'
+
+    # CPU 软解降级
+    if actual_duration <= 120.0:
+        # 短视频直接全片软解，多线程拉满
+        media_command([ffmpeg, '-nostdin', '-hide_banner', '-v', 'error', '-xerror',
+                       '-i', str(partial), '-map', '0:v', '-map', '0:a?',
+                       '-threads', '0', '-f', 'null', '-'], deadline)
+        return 'cpu_full'
+
+    # 长视频：智能头尾与接缝处抽样校验，避免单线程硬解耗时数小时
+    windows = compute_check_windows(actual_duration, segment_durations, window_seconds=30.0)
+    for start, length in windows:
+        cmd = [ffmpeg, '-nostdin', '-hide_banner', '-v', 'error', '-xerror']
+        if start > 0:
+            cmd.extend(['-ss', str(start)])
+        cmd.extend(['-i', str(partial), '-t', str(length),
+                    '-map', '0:v', '-map', '0:a?', '-threads', '0', '-f', 'null', '-'])
+        media_command(cmd, deadline)
+    return 'cpu_windows'
+
+
 def select_inputs(run_dir, manifest):
     segments = manifest['segments']
     if not segments:
@@ -133,9 +212,8 @@ def merge_rendered(run_dir, manifest, deadline, *, min_free_gib=10,
         raise MergeError('merge_duration_mismatch')
     if merged_signature != signature:
         raise MergeError('merge_output_stream_mismatch')
-    # 实际解码全片验证可读性；不等同于人工确认音画同步、弹幕同步。
-    media_command([ffmpeg, '-nostdin', '-hide_banner', '-v', 'error', '-xerror',
-                   '-i', str(partial), '-map', '0:v', '-map', '0:a?', '-f', 'null', '-'], deadline)
+    # 验证可读性（支持 CUDA 硬件加速或接缝窗口抽样校验）；不等同于人工确认音画同步、弹幕同步。
+    decode_mode = verify_decode(ffmpeg, partial, actual, durations, deadline)
     remaining(deadline)
     partial.replace(output)
     return {'status': 'success', 'mode': 'stream_copy',
@@ -143,7 +221,8 @@ def merge_rendered(run_dir, manifest, deadline, *, min_free_gib=10,
             'segments': [key for key, _ in inputs], 'segment_count': len(inputs),
             'expected_duration_seconds': expected, 'duration_seconds': actual,
             'duration_tolerance_seconds': tolerance, 'size': output.stat().st_size,
-            'decode_verified': True, 'elapsed_seconds': time.monotonic() - started}
+            'decode_verified': True, 'decode_mode': decode_mode,
+            'elapsed_seconds': time.monotonic() - started}
 
 
 def finalize_merge(coordinator, events, deadline, *, min_free_gib=10,

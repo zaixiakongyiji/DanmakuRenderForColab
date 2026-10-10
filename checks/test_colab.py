@@ -318,6 +318,41 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(c.manifest['merge']['backup']['status'], 'error')
             self.assertNotEqual(c.manifest['status'], 'success')
 
+    def test_compute_check_windows(self):
+        from colab_support.merge import compute_check_windows
+        self.assertEqual(compute_check_windows(50.0, [50.0]), [(0.0, 50.0)])
+        windows = compute_check_windows(200.0, [100.0, 100.0], window_seconds=30.0)
+        self.assertEqual(windows, [(0.0, 30.0), (85.0, 30.0), (170.0, 30.0)])
+
+    def test_probe_hwaccel_cuda(self):
+        from colab_support.merge import probe_hwaccel_cuda, MergeError
+        with patch('colab_support.merge.media_command') as mock_cmd:
+            mock_cmd.return_value = None
+            self.assertTrue(probe_hwaccel_cuda('ffmpeg', 'test.mp4', time.monotonic() + 10))
+            mock_cmd.side_effect = MergeError('merge_media_command_failed')
+            self.assertFalse(probe_hwaccel_cuda('ffmpeg', 'test.mp4', time.monotonic() + 10))
+            mock_cmd.side_effect = MergeError('merge_timeout')
+            with self.assertRaises(MergeError):
+                probe_hwaccel_cuda('ffmpeg', 'test.mp4', time.monotonic() + 10)
+
+    def test_verify_decode_modes(self):
+        from colab_support.merge import verify_decode
+        with patch('colab_support.merge.probe_hwaccel_cuda', return_value=True), \
+             patch('colab_support.merge.media_command') as mock_cmd:
+            mode = verify_decode('ffmpeg', 'test.mp4', 200.0, [100.0, 100.0], time.monotonic() + 10)
+            self.assertEqual(mode, 'cuda_full')
+            self.assertIn('-hwaccel', mock_cmd.call_args[0][0])
+        with patch('colab_support.merge.probe_hwaccel_cuda', return_value=False), \
+             patch('colab_support.merge.media_command') as mock_cmd:
+            mode = verify_decode('ffmpeg', 'test.mp4', 50.0, [50.0], time.monotonic() + 10)
+            self.assertEqual(mode, 'cpu_full')
+            self.assertIn('-threads', mock_cmd.call_args[0][0])
+        with patch('colab_support.merge.probe_hwaccel_cuda', return_value=False), \
+             patch('colab_support.merge.media_command') as mock_cmd:
+            mode = verify_decode('ffmpeg', 'test.mp4', 200.0, [100.0, 100.0], time.monotonic() + 10)
+            self.assertEqual(mode, 'cpu_windows')
+            self.assertEqual(mock_cmd.call_count, 3)
+
 
 if __name__ == '__main__':
     unittest.main()

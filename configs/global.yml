@@ -3,15 +3,16 @@
 # ######################
 
 # 第三方工具路径，设置为空将会自动选择
-executable_tools_path: 
+executable_tools_path:
   ffmpeg: ~
   ffprobe: ~
   biliup: ~
 
 # DMR引擎参数
-dmr_engine_args: 
+dmr_engine_args:
   # 选择组件
   # 可选组件： downloader（下载器）, render（渲染器）, uploader（上传器）, cleaner（清理器），webservice（WebUI服务，默认不启用）
+#  enabled_plugins: ['downloader', 'render', 'uploader', 'cleaner', 'webservice']
   enabled_plugins: ['downloader', 'render', 'uploader', 'cleaner']
   # 配置文件路径
   # 可设置为文件/文件夹列表
@@ -23,7 +24,7 @@ download_args:
   live:
     # 直播间链接
     # 请填写标准格式链接，例如：https://live.bilibili.com/123456
-    url: 
+    url:
     # 是否使用同步上传功能（正在测试，目前只支持streamlink）
     # 启用此功能必须使用实时上传，并使用biliwebapi上传引擎
     sync: False
@@ -72,7 +73,7 @@ download_args:
       huya_mobile_api: False
     # 高级视频录制参数
     # 请确保你明白这些参数的含义后再修改
-    advanced_video_args: 
+    advanced_video_args:
       # 默认分辨率，此选项用于在程序无法获取流分辨率时指定默认分辨率用于弹幕录制
       default_resolution: [1920, 1080]
       # 开播检测间隔，每隔这段时间检测一次是否开播
@@ -115,7 +116,7 @@ download_args:
 
     # 以下是弹幕录制参数
     # 弹幕录制格式，只能选择ass
-    dm_format: ass 
+    dm_format: ass
     # 弹幕上下间距（行距），设置为0-1的表示为视频宽度的倍数，设置为大于1的数表示像素，默认6
     margin_h: 6
     # 弹幕左右间距，设置为-1表示允许弹幕叠加，设置为0-1的表示间距为视频宽度的倍数，设置为大于1的数表示像素，默认0.05
@@ -182,12 +183,12 @@ download_args:
       # 弹幕文件最小录制时间（秒），小于此录制时间的弹幕文件将被删除
       # 此功能可用于删除因为录制错误导致的许多空弹幕文件
       dm_file_min_time: 30
-  
+
   # 视频下载
   videos:
     # 需要下载的视频链接
     # 可以是UP主主页，播放列表，合集等
-    url: 
+    url:
     # 录制输出文件夹
     output_dir: ./视频下载
     # 录制文件名称格式
@@ -233,7 +234,7 @@ download_args:
     # 附加参数列表
     # 此参数将直接传入下载引擎，可以用来设置一些特殊的下载参数
     extra_args: []
-  
+
   # 虚拟下载
   # 可以监控文件夹中的视频文件，用于和其他软件协同，详情请参考文档
   virtual:
@@ -265,7 +266,7 @@ download_args:
     # 检测视频的起始时间，默认为当前时间
     start_time: ~
     # 高级视频参数
-    advanced_video_args: 
+    advanced_video_args:
       # 视频文件最小大小（MB），小于此大小的视频文件将会被忽略，默认1MB
       min_video_size: 1
       # 视频文件最小录制时间（秒），小于此录制时间的视频文件将被忽略，默认不启用
@@ -295,7 +296,7 @@ render_args:
     # 硬件解码参数，默认由FFmpeg自动判断，如果出现问题可以设为空
     hwaccel_args: [-hwaccel, auto]
     # 视频编码器，NVIDIA设置为h264_nvenc，AMD设置为h264_amf，Apple用户设置为h264_videotoolbox，CPU设置为libx264
-    vencoder: h264_nvenc
+    vencoder: h264_amf
     # 视频编码器参数，默认恒定码率15Mbps
     vencoder_args: [-b:v, 15M]
     # 音频编码器
@@ -322,7 +323,7 @@ render_args:
     # 硬件解码参数，默认由FFmpeg自动判断，如果出现问题可以设为空
     hwaccel_args: [-hwaccel, auto]
     # 视频编码器，NVIDIA设置为h264_nvenc，AMD设置为h264_amf，Apple用户设置为h264_videotoolbox，CPU设置为libx264
-    vencoder: h264_nvenc
+    vencoder: h264_amf
     # 视频编码器参数，默认恒定码率15Mbps
     vencoder_args: [-b:v, 15M]
     # 音频编码器
@@ -429,7 +430,7 @@ upload_args:
     # 额外请求参数（此功能暂不生效）
     # 此参数将直接作为上传请求提交的参数
     extra_kwargs: {}
-  
+
   # 上传到YouTube
   # 此功能使用较复杂，细节请参考文档
   youtube:
@@ -537,7 +538,7 @@ clean_args:
     w_srcfile: False
     w_srcpre: True
   # 自定义命令
-  custom: 
+  custom:
     # 命令行参数，可以使用关键字替换
     # 为保证安全调用，请使用参数列表的形式，例如：['rm', '-rf', '{PATH}']
     command: ~
