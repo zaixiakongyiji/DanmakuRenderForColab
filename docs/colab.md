@@ -2,7 +2,7 @@
 
 流程：本地检测开播 → 打开指定 Notebook 并点击一次全部运行 → 每小时录制一段 → 渲染、分段备份 → 向同一 B 站稿件追加分 P → 下播后完成媒体归档、投稿收尾和结果汇总。
 
-首版限定一个直播间、一个投稿账号、一个活动运行时。不自动清理媒体或释放运行时；原来的 main.py 和本地配置继续使用原路径。
+首版限定一个直播间、一个投稿账号、一个活动运行时。自动模式保存结果后请求释放运行时，手动模式保留运行时；不自动清理 Drive 媒体；原来的 main.py 和本地配置继续使用原路径。正式 Notebook 设置为 GPU 类型即可，监控期间无需提前连接运行时。
 
 ## 来源与许可证状态
 
@@ -26,7 +26,8 @@ colab_support、colab_run.py、colab_trigger.py、colab_upload.py 和 Notebook �
 | 本地 CLI 自动触发、状态锁、请求认领、回执和 Notebook 顺序防护 | 已实现，离线验证；真实浏览器与 Drive 同步链待验收 |
 | B 站首 P 创建、后续追加、投稿事务日志和补传 | 已实现，模拟 API 验证；真实投稿待验收 |
 | 自然下播、真实账号两个 P、审核和公开状态 | 本轮未执行；submitted 不表示审核通过或已公开 |
-| 自动删除媒体、释放运行时、跨运行时续录、多直播间 | 不在本版范围 |
+| 开播后 Run all 连接、Notebook 内部释放运行时 | 新增实现，需真实 Colab 验收 |
+| 自动删除 Drive 媒体、跨运行时续录、多直播间 | 不在本版范围 |
 
 新增行为不能凭离线测试认定已完成云端验收。首次授权、登录凭据和私有配置由用户准备。本地正式任务在验收前继续按原配置运行。
 
@@ -117,11 +118,21 @@ MyDrive/DMRColab/runs/<run_id>/
 
 结果分别查看 recording_backup、merge、upload。启用投稿时，至少有一个有效 P 且所有应投 P 都确认提交或按短段规则跳过，投稿才算成功。全短场、失败、unknown 或超时都非零退出。已提交内容不自动撤回。
 
-第一次中断通过 STOP 请求受控停止，仍处理已完成分段；第二次通过 FORCE_STOP 明确强制结束。监督器可终止 worker 及其子进程组；强制结束不宣称成功。程序结束保留运行时和媒体，不继续等待下一场。
+第一次中断通过 STOP 请求受控停止，仍处理已完成分段；第二次通过 FORCE_STOP 明确强制结束。监督器可终止 worker 及其子进程组；强制结束不宣称成功。不继续等待下一场。手动模式保留运行时和媒体；自动模式由 Notebook 完成汇总和最终清单同步，再调用 runtime.unassign()。
 
 最终元数据备份或回执写入失败时，Drive 可能留在旧状态，须结合退出码、本地清单和文件核对；不要只看某份旧 success。
 
 ## 5. 本地自动触发和回执
+
+Windows 可双击仓库根目录的 `start_colab_monitor.cmd`。首次运行：
+
+```powershell
+.\start_colab_monitor.cmd --setup
+```
+
+向导选择任务配置（例如 `configs/DMR-example.yml`），填写本机 Google Drive for desktop 的同步根目录，例如 `G:\你的云端硬盘`，以及私有 Colab Notebook 地址。向导会自动创建 `DMRColab/control`，设置保存在 `.temp/colab-monitor-settings.json`，不会保存 Cookie。后续直接双击 `.cmd` 即可复用设置。
+
+`--drive-sync-root` 必须是本机可读写的同步目录。触发器把 `request.json`、`claim.json` 和 `ack.json` 写入该目录，Google Drive 将它们同步给 Notebook；录像、渲染和合并仍在 Colab 运行时处理，并备份到 Drive 的 `DMRColab/runs/<run_id>/`。
 
 手动打开模式：
 
@@ -129,15 +140,21 @@ MyDrive/DMRColab/runs/<run_id>/
 python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive"
 ```
 
-自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。预先登录、授权并确认 Notebook 使用 GPU 且运行时已连接：
+自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。首次登录、授权和保存表单可使用 CPU。正式副本保存为 GPU 类型，选择“读取本地触发请求”，准备完成后断开运行时；监控期间无需 GPU 连接，Run all 在开播后申请运行时。实际 GPU 型号由预检记录：
 
 ```powershell
 python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive" --notebook-url "<自己的 Notebook URL>" --auto-run --cdp-url http://127.0.0.1:9222
 ```
 
-自动浏览器适配依赖本地 playwright，可用 python -m pip install playwright 安装。连接已有专用浏览器，不启动或控制日常浏览器。CDP 只接受 http 的 127.0.0.1、localhost、::1 和显式端口，不接受外部地址。
+自动浏览器适配依赖本地 Playwright，Windows B站监控可直接安装 `colab_support/monitor_requirements.txt`。连接已有专用浏览器，不启动或控制日常浏览器。CDP 只接受 http 的 127.0.0.1、localhost、::1 和显式端口，不接受外部地址。完整 `requirements.txt` 还包含 Douyu/Douyin 等平台使用的 `quickjs`；Windows Python 3.13 可能没有对应 wheel，B站监控无需安装它。
 
-只操作配置的 Notebook，至多点击一次“全部运行/Run all”。通过可见按钮、状态区和弹窗判断；登录、授权、运行中、运行时未连接或 UI 无法辨别时 needs_attention。不点击授权、不重启运行时、不保活。页面 DOM 可变化，真实浏览器适配必须另行验收；无法识别时宁可交给人工检查。
+只操作配置的 Notebook，至多点击一次“全部运行/Run all”。通过可见按钮、状态区和弹窗判断；登录、授权、运行中、连接中或 UI 无法辨别时 needs_attention；明确未连接时允许点击 Run all。不点击授权、不重启运行时、不保活。页面 DOM 可变化，真实浏览器适配必须另行验收；无法识别时宁可交给人工检查。
+
+自动模式在⑦完成结果汇总和媒体校验后保存最终清单与回执，随后调用 `google.colab.runtime.unassign()`；⑧仅供手动模式检查。失败任务先补存尚未备份的已关闭媒体到 `recovery/`，不复制 Cookie、私有配置和原始 console 日志。保存无法完成或监督器仍活动时不释放，保留唯一副本并报告 `needs_attention`。认领前的安装、授权等错误无法保证自动释放，15 分钟认领超时后人工检查。
+
+清单和回执增加 `runtime_release.status`：`requested` 表示释放意图已保存并将请求释放，`unknown` 表示持久化或调用异常；事件名称为 `runtime_release_requested`，不是任务成功状态。任务的 `success/failed` 保持原语义。请求发出后无法从已结束内核确认释放；本地在最终回执至少 60 秒后只读检查指定 Notebook，明确未连接才允许重新武装，仍连接或无法判断进入 `needs_attention`，不重复执行。
+
+CPU 准备阶段的 Drive 授权不保证新 GPU 运行时免授权。出现授权弹窗须由本人完成，不自动同意。临时磁盘内容会随运行时释放丢失，结果检查使用 Drive。上述机制只验证挂载目录读回一致性，不承诺服务端持久性。
 
 默认 60 秒轮询，连续两次开播触发；上场已经回执终结且连续三次下播后才能重新武装。查询失败清空连续计数，不把活动任务判为结束。OS 进程锁防止本地重复启动，启动意图先写盘再操作浏览器。状态损坏、旧协议状态或启动结果不明不会自动重置和重新点击。
 
@@ -177,7 +194,7 @@ python colab_upload.py --run-id <run_id> --reconcile-bvid <BVID>
 python -m unittest discover -s checks -p "test_colab*.py" -v
 ```
 
-2026-10-10 本地最终验证：71 项离线测试全部通过，git diff --check 通过。真实浏览器、Drive 同步、B 站接口与测试账号投稿尚未执行。离线验证后按用户授权发布本次源码改造，发布不代表真实云端验收完成。
+2026-10-10 本地最终验证：88 项离线测试全部通过，git diff --check 通过。真实浏览器、Drive 同步、B 站接口与测试账号投稿尚未执行。离线验证后按用户授权发布本次源码改造，发布不代表真实云端验收完成。
 
 离线测试只使用模拟浏览器、模拟 API、临时目录和合成媒体。覆盖真实 CLI 参数、Cookie 不调用登录工具、首 P 创建与同 BVID 追加、备份门槛、乱序与重复、全短场、分块失败、提交超时核对、未知结果去重、恢复校验、进程锁、请求过期、损坏状态、查询中断、Notebook 顺序与旧变量防护，并保留原录制、渲染、合并和停止回归。
 
@@ -188,4 +205,4 @@ python -m unittest discover -s checks -p "test_colab*.py" -v
 3. 测试一次受控停止和自然下播，检查尾段、合并、音画与弹幕同步。
 4. 记录渲染耗时/分段时长、积压、磁盘使用，以及 Colab UI 的 CU 消耗。不预先认定 T4 或其他 GPU 性能已验收。
 
-完成后检查 Drive 网页和本地退出码，再由本人断开并删除运行时。未有真实云端证据时，报告仅限本地实现和离线验证。
+自动模式完成后检查 Drive、最终回执和浏览器断开状态；手动模式检查完再由本人断开并删除运行时。新增按需连接与自动释放需实测成功场次、预检失败、渲染失败、受控停止及备份失败保留运行时。未有真实云端证据时，报告仅限本地实现和离线验证。

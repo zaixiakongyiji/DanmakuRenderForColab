@@ -257,10 +257,6 @@ class ColabLauncher:
             return False
         if page.get_by_role('dialog').count():
             return False
-        runtime = page.get_by_role('button', name=re.compile(
-            r'已连接|Connected|RAM.*(磁盘|Disk)|显示.*(RAM|内存).*使用|Show.*RAM.*usage', re.I))
-        if runtime.count() != 1 or not runtime.is_visible():
-            return False
         stop = page.get_by_role('button', name=re.compile(r'停止执行|中断执行|Interrupt execution|Stop execution', re.I))
         if stop.count():
             return False
@@ -269,6 +265,37 @@ class ColabLauncher:
             return False
         button.click(timeout=5000)
         return True
+
+    def runtime_connection_state(self):
+        """返回 True=明确连接、False=明确未连接、None=无法判断。"""
+        if not self.auto_run or not self.cdp_url:
+            return None
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp(self.cdp_url)
+                pages = [p for context in browser.contexts for p in context.pages]
+                base = self.notebook_url.split('#', 1)[0]
+                page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
+                if page is None:
+                    return None
+                return self._connection_state(page)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _connection_state(page):
+        if page.get_by_role('dialog').count():
+            return None
+        connected = page.get_by_role('button', name=re.compile(
+            r'^(已连接|Connected)(\s|$)|RAM.*(磁盘|Disk)|显示.*(RAM|内存).*使用|Show.*RAM.*usage', re.I))
+        if connected.count() == 1 and connected.is_visible():
+            return True
+        connect = page.get_by_role('button', name=re.compile(
+            r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|Connect to hosted runtime)$', re.I))
+        if connect.count() == 1 and connect.is_visible() and connect.is_enabled():
+            return False
+        return None
 
 
 class TriggerMonitor:
@@ -296,6 +323,9 @@ class TriggerMonitor:
         terminal = self.state.ack_status in {'success', 'failed'}
         if self.state.triggered or self.state.run_id:
             if terminal:
+                if self.state.status == 'needs_attention':
+                    self.state.save(self.state_file)
+                    return TriggerResult('needs_attention', run_id=self.state.run_id, error=self.state.last_error)
                 self.state.offline_streak = self.state.offline_streak + 1 if status is False else 0
                 if self.state.offline_streak >= self.offline_confirmations:
                     self.state = TriggerState(self.room_url, status='ended')
@@ -356,6 +386,19 @@ class TriggerMonitor:
             self.state.status, self.state.last_error = ack['status'], ack.get('error')
             if ack.get('error') and ack['status'] not in {'success', 'failed'}:
                 self.state.status = 'needs_attention'
+            if ack['status'] in {'success', 'failed'} and self.launcher.auto_run:
+                release = ack.get('runtime_release', {})
+                if not isinstance(release, dict):
+                    raise ValueError()
+                if release.get('status') == 'unknown':
+                    self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_unknown'
+                elif release.get('status') != 'requested' or (now - updated).total_seconds() < 60:
+                    # 给最终清单落盘、释放请求和 UI 状态变化留出时间，期间不重新武装。
+                    self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_pending'
+                    if (now - updated).total_seconds() >= 60:
+                        self.state.last_error = 'runtime_release_unknown'
+                elif self.launcher.runtime_connection_state() is not False:
+                    self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_unconfirmed'
             if ack['status'] not in {'success', 'failed'} and (now - updated).total_seconds() > 300:
                 self.state.status, self.state.last_error = 'needs_attention', 'runtime_heartbeat_stale'
         except (OSError, ValueError, TypeError, KeyError, AttributeError):

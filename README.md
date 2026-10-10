@@ -2,9 +2,9 @@
 
 基于 DanmakuRender v5 的 Colab 直播录制与弹幕渲染工具。将耗时的录制、渲染、合并和备份放到云端运行，也可由本地检测开播后触发 Notebook。保留原有桌面入口。
 
-`本地检测开播 → Colab 录制与弹幕采集 → 分段渲染与 Drive 备份 → 可选 B 站多 P 投稿 → 下播收尾与全场合并归档`
+`本地检测开播 → Colab 录制与弹幕采集 → 分段渲染与 Drive 备份 → 可选 B 站多 P 投稿 → 下播收尾与全场合并归档 → 自动模式请求释放运行时`
 
-当前 Colab 流程限定一个 B 站直播间、一个投稿账号和一个活动运行时。程序结束后保留运行时和媒体文件，不自动清理或释放资源。
+当前 Colab 流程限定一个 B 站直播间、一个投稿账号和一个活动运行时。自动触发模式在结果持久化后请求释放运行时；手动测试模式保留运行时。Drive 媒体不自动删除。
 
 ## 功能与验证状态
 
@@ -13,15 +13,15 @@
 - 可选自动投稿：第一段创建稿件，后续段按序追加到同一 BVID；不足 120 秒的段仍备份，但不投稿。全场合并视频仅用于归档。
 - 支持本地自动触发、运行回执、受控停止和按运行编号补传；结果不明的投稿会停止追加，供核对。
 
-2026-10-10：71 项本地离线测试通过。此前用户已试跑云端录制、渲染、备份和合并；本次新增自动触发及多 P 投稿仍需真实云端和测试账号验收。
+2026-10-10：88 项本地离线测试通过。此前用户已试跑云端录制、渲染、备份和合并；本次新增自动触发及多 P 投稿仍需真实云端和测试账号验收。
 
 ## Colab 快速开始
 
-1. 从本仓库 `codex/colab-poc` 分支打开 [notebooks/colab_record.ipynb](notebooks/colab_record.ipynb)，在 Colab 保存一份私有副本并选择支持 NVENC 的 NVIDIA GPU 运行时。
+1. 从本仓库 `codex/colab-poc` 分支打开 [notebooks/colab_record.ipynb](notebooks/colab_record.ipynb)，在 Colab 保存一份私有副本并将 Notebook 设置为支持 NVENC 的 NVIDIA GPU 类型；首次登录和授权可先使用 CPU，监控期间无需保持连接。
 2. 将现有观看登录 JSON 手动放入私有 Drive 的 `MyDrive/DMRColab/credentials/bilibili.json`。要求 `cookie_info.cookies` 列表包含非空 `SESSDATA`；程序不调用登录工具。
 3. 按顺序执行源码准备、依赖安装、Drive 授权、运行参数、预检、正式运行和结果检查单元格。手动运行时填写 `ROOM_URL`。
 4. 先关闭投稿做短试跑：设置 `SEGMENT_SECONDS = 300`、`MAX_RECORD_HOURS = 0.2`；只录一小时设置 `MAX_RECORD_HOURS = 1`。录制结束后的渲染、备份及投稿收尾可能使总运行时间更长。
-5. 核对退出码、清单以及 Drive 文件，播放检查音画和弹幕同步，再自行断开运行时。
+5. 核对退出码、清单以及 Drive 文件，播放检查音画和弹幕同步，手动模式检查后自行断开；自动模式先汇总和持久化结果，再请求释放运行时。
 
 录像及清单位于 `MyDrive/DMRColab/runs/<run_id>/`：`source/` 保存原片，`danmaku/` 保存 ASS，`rendered/` 保存弹幕版分段，`merged/complete.mp4` 保存全场归档。`manifest.json` 分别汇总录制备份、合并及投稿结果。
 
@@ -39,14 +39,23 @@
 
 ## 本地检测开播与自动触发
 
+Windows 用户也可以双击 `start_colab_monitor.cmd`。首次运行加 `--setup`，按提示选择任务配置、填写 Google Drive for desktop 的本地同步目录（例如 `G:\你的云端硬盘`）、私有 Colab Notebook 地址和专用浏览器 CDP 地址；设置会保存在被 Git 忽略的 `.temp` 中。选择 `DMR-example.yml` 后，入口会自动读取其中的直播间地址。
+
+```powershell
+.\start_colab_monitor.cmd --setup
+```
+
+设置完成后，直接双击 `start_colab_monitor.cmd` 即可开始本地监控。它会在连续两次确认开播后向 Drive 写入运行请求，打开指定 Notebook 并点击一次“全部运行”。首次登录、Drive 授权和保存参数可以使用 CPU 运行时。在 Notebook 顶部选择“读取本地触发请求”，将正式副本保存为 GPU 类型，然后断开准备运行时。监控期间无需连接 GPU；开播后点击 Run all 才申请运行时，实际 GPU 型号由预检记录。若新运行时要求再次授权，仍须人工完成，不承诺无人值守。之后无需再次填写路径。
+
+`--drive-sync-root` 指的是本机 Drive 同步目录，因为本地触发器需要把请求和回执写成文件，让 Google Drive 同步到 Colab。这个目录只传递控制文件，不保存云端录制过程中的视频。也可以继续使用命令行入口：
+
 本地安装项目依赖，另安装浏览器适配依赖：
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m pip install playwright
+python -m pip install -r colab_support/monitor_requirements.txt
 ```
 
-需要 Google Drive for desktop 同步目录，以及已登录、已授权并连接 GPU 运行时的 Notebook。先使用仅打开页面的模式：
+需要 Google Drive for desktop 同步目录，以及已登录、保存为 GPU 类型并配置好参数的私有 Notebook；监控期间无需连接运行时。先使用仅打开页面的模式：
 
 ```powershell
 python colab_trigger.py --url "https://live.bilibili.com/<房间号>" --drive-sync-root "<Drive 同步根目录>" --notebook-url "<自己的 Notebook URL>"
@@ -59,6 +68,10 @@ python colab_trigger.py --url "https://live.bilibili.com/<房间号>" --drive-sy
 ```
 
 自动触发时 Notebook 的 `ROOM_URL` 留空，读取同步的运行请求。遇到登录、授权、页面忙碌或无法确认的状态会报告 `needs_attention`；不会自动授权、重启运行时或保活。详细浏览器条件与回执协议见 [Colab 文档](docs/colab.md)。
+
+自动模式的 `manifest.json` 与 `ack.json` 包含 `runtime_release`：`requested` 表示已保存释放意图并请求 `runtime.unassign()`，不表示已确认释放；`unknown` 表示保存或释放异常。最终回执后等待至少 60 秒，浏览器必须明确显示未连接才允许按下播确认重新武装；仍连接或无法判断时报告 `needs_attention`，不重复点击。
+
+失败任务会先补存未备份媒体到 `recovery/`，保存失败或仍有活动录制进程时保留运行时供检查。源码准备、依赖安装、Drive 授权等认领前失败由认领超时报告；不能保证这些阶段自动释放。`/content` 文件会随运行时释放丢失，请从 Drive 检查最终结果。
 
 ## 补传与离线测试
 

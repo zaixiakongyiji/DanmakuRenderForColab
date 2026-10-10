@@ -5,7 +5,8 @@ lxml
 pyyaml
 stream-gears
 protobuf>=4.23.2
-quickjs
+# quickjs 的 Windows Python 3.13 源码构建会把 GCC 参数传给 MSVC；B站流程不需要它。
+quickjs; platform_system != "Windows" or python_version < "3.13"
 websocket-client
 brotli
 yt-dlp

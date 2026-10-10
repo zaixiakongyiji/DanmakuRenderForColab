@@ -1,0 +1,5 @@
+# 本地开播监控入口依赖；B站模式不需要 Douyu/Douyin 的 quickjs。
+requests
+easydict
+pyyaml
+playwright

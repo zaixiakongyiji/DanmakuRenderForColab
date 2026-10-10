@@ -15,6 +15,7 @@ class NotebookSession:
     run_id: str
     command: tuple
     phase: str = 'parameters'
+    automatic: bool = False
 
     def preflight(self, checked):
         if self.phase != 'parameters':
@@ -62,4 +63,4 @@ def prepare_session(project, drive_root, cookie, room_url, executable, *, segmen
                '--max-record', str(max_record), '--drain-timeout', str(drain_timeout),
                '--min-free-gib', str(min_free_gib)]
     return NotebookSession(Path(project), Path(drive_root), run_dir,
-        Path(drive_root) / 'DMRColab/runs' / run_id, run_id, tuple(command))
+        Path(drive_root) / 'DMRColab/runs' / run_id, run_id, tuple(command), automatic=trigger is not None)
