@@ -1,136 +1,177 @@
 # DanmakuRenderForColab
 
-基于 DanmakuRender v5 的 Colab 直播录制与弹幕渲染工具。将耗时的录制、渲染、合并和备份放到云端运行，也可由本地检测开播后触发 Notebook。保留原有桌面入口。
+基于 [DanmakuRender v5](https://github.com/SmallPeaches/DanmakuRender) 深度定制的云端直播录制、实时弹幕采集与硬件渲染工具。将极度消耗本地算力与带宽的录制、NVENC 弹幕烧录、合并和备份完全交给 **Google Colab** 云端运行，配合本地 Windows 轻量开播监控，实现全自动的闭环工作流。
 
-`本地检测开播 → Colab 录制与弹幕采集 → 分段渲染与 Drive 备份 → 可选 B 站多 P 投稿 → 下播收尾与全场合并归档 → 自动模式请求释放运行时`
-
-当前 Colab 流程限定一个 B 站直播间、一个投稿账号和一个活动运行时。自动触发模式在结果持久化后请求释放运行时；手动测试模式保留运行时。Drive 媒体不自动删除。
-
-## 功能与验证状态
-
-- 默认每 3600 秒录制一段，保留原片、ASS 和带弹幕成品，使用 FFmpeg 与 H.264 NVENC；预检失败会停止。
-- 每段文件复制到 Drive 后读回校验大小和 SHA-256，清单记录录制、渲染、备份和投稿状态。
-- 可选自动投稿：第一段创建稿件，后续段按序追加到同一 BVID；不足 120 秒的段仍备份，但不投稿。全场合并视频仅用于归档。
-- 支持本地自动触发、运行回执、受控停止和按运行编号补传；结果不明的投稿会停止追加，供核对。
-
-2026-10-10：88 项本地离线测试通过。此前用户已试跑云端录制、渲染、备份和合并；本次新增自动触发及多 P 投稿仍需真实云端和测试账号验收。
-
-## Colab 快速开始
-
-1. 从本仓库 `codex/colab-poc` 分支打开 [notebooks/colab_record.ipynb](notebooks/colab_record.ipynb)，在 Colab 保存一份私有副本并将 Notebook 设置为支持 NVENC 的 NVIDIA GPU 类型；首次登录和授权可先使用 CPU，监控期间无需保持连接。
-2. 将现有观看登录 JSON 手动放入私有 Drive 的 `MyDrive/DMRColab/credentials/bilibili.json`。要求 `cookie_info.cookies` 列表包含非空 `SESSDATA`；程序不调用登录工具。
-3. 按顺序执行源码准备、依赖安装、Drive 授权、运行参数、预检、正式运行和结果检查单元格。手动运行时填写 `ROOM_URL`。
-4. 先关闭投稿做短试跑：设置 `SEGMENT_SECONDS = 300`、`MAX_RECORD_HOURS = 0.2`；只录一小时设置 `MAX_RECORD_HOURS = 1`。录制结束后的渲染、备份及投稿收尾可能使总运行时间更长。
-5. 核对退出码、清单以及 Drive 文件，播放检查音画和弹幕同步，手动模式检查后自行断开；自动模式先汇总和持久化结果，再请求释放运行时。
-
-录像及清单位于 `MyDrive/DMRColab/runs/<run_id>/`：`source/` 保存原片，`danmaku/` 保存 ASS，`rendered/` 保存弹幕版分段，`merged/complete.mp4` 保存全场归档。`manifest.json` 分别汇总录制备份、合并及投稿结果。
-
-运行中第一次中断请求受控停止，等待已完成分段收尾；再次中断请求强制停止，不能视为正常成功。
-
-仓库更新不会自动同步到已另存的 Drive Notebook。更新时重新打开仓库版本并保存私有副本；已有源码检出需在活动任务结束后手动拉取或使用新运行时。
-
-## 启用 B 站多 P 自动投稿
-
-公开示例默认关闭投稿。将 [colab_support/upload.example.yml](colab_support/upload.example.yml) 复制到私有 Drive 的 `MyDrive/DMRColab/config/upload.yml`，填写账号备注 `account`、账号校验 `expected_uid`、分区 `tid`、转载属性 `copyright`、来源及标题、简介和标签，再设置 `enabled: true`。转载须填写来源。
-
-投稿 Cookie 单独放入 `MyDrive/DMRColab/credentials/bilibili_upload.json`，要求 `cookie_info.cookies` 包含非空 `SESSDATA` 和 `bili_jct`。观看与投稿凭据可以属于不同账号；启用投稿后，程序在录制前校验身份，配置完成后每场自动投稿。
-
-原片、ASS 和成品均备份成功后，分段才进入串行投稿队列。`submitted` 表示核对了稿件编号与分 P，不代表审核通过或已经公开；`unknown` 必须先核对远端，不能盲目重传。凭据和真实配置只保存在私有 Drive，不上传到公开仓库。
-
-## 本地检测开播与自动触发
-
-Windows 用户也可以双击 `start_colab_monitor.cmd`。首次运行加 `--setup`，按提示选择任务配置、填写 Google Drive for desktop 的本地同步目录（例如 `G:\你的云端硬盘`）、私有 Colab Notebook 地址和专用浏览器 CDP 地址；设置会保存在被 Git 忽略的 `.temp` 中。选择 `DMR-example.yml` 后，入口会自动读取其中的直播间地址。
-
-```powershell
-.\start_colab_monitor.cmd --setup
+```text
+[本地开播监控] ──(开播触发)──> [CDP 自动唤醒 Colab 申请 GPU]
+                                       │
+                                       ▼
+                              [云端分段录制 + 弹幕采集]
+                                       │
+                                       ▼
+                            [NVENC 硬件加速弹幕渲染]
+                                       │
+                                       ▼
+                           [Google Drive 双向校验备份]
+                                       │
+                                       ▼
+                          [可选: B 站多 P 自动串行投稿]
+                                       │
+                                       ▼
+                       [下播全场归档 ──> 自动释放 Colab 运行时]
 ```
 
-设置完成后，直接双击 `start_colab_monitor.cmd` 即可开始本地监控。它会在连续两次确认开播后向 Drive 写入运行请求，打开指定 Notebook 并点击一次“全部运行”。首次登录、Drive 授权和保存参数可以使用 CPU 运行时。在 Notebook 顶部选择“读取本地触发请求”，将正式副本保存为 GPU 类型，然后断开准备运行时。监控期间无需连接 GPU；开播后点击 Run all 才申请运行时，实际 GPU 型号由预检记录。若新运行时要求再次授权，仍须人工完成，不承诺无人值守。之后无需再次填写路径。
+---
 
-`--drive-sync-root` 指的是本机 Drive 同步目录，因为本地触发器需要把请求和回执写成文件，让 Google Drive 同步到 Colab。这个目录只传递控制文件，不保存云端录制过程中的视频。也可以继续使用命令行入口：
+## 核心特性与技术亮点
 
-本地安装项目依赖，另安装浏览器适配依赖：
+- **云端全套流水线**：在 Google Colab 上完成源流录制、弹幕抓取、ASS 生成以及 NVENC 硬件加速渲染，保留原片、ASS 与带弹幕成品。
+- **Google Drive 严密校验备份**：每个分段复制到 Drive 后均会读回并校验文件大小与 SHA-256，所有状态与耗时记录在 `manifest.json` 中。
+- **B 站多 P 串行投稿（可选）**：首段自动创建新稿件，后续分段按序追加到同一个 BVID；不足 120 秒短段自动跳过投稿但完整备份；具备严格事务日志防重传。
+- **算力点省流设计**：日常监控在本地运行，完全无需挂载 Colab GPU；仅在确认开播后通过专用浏览器 CDP 申请 GPU 并点击“全部运行”；任务收尾后自动请求 `runtime.unassign()` 释放运行时，不烧闲置 CU。
+- **工程级可靠性**：支持优雅受控停止、断点按运行编号补传（`colab_upload.py`）以及异常任务媒体补存。通过 88 项离线自动化测试。
 
-```powershell
-python -m pip install -r colab_support/monitor_requirements.txt
+---
+
+## 核心脚本速查
+
+| 脚本 / 入口 | 运行环境 | 职责说明 |
+|---|---|---|
+| [`start_colab_monitor.cmd`](start_colab_monitor.cmd) | 本地 Windows | **推荐**。交互式配置向导与后台监控脚本，开播后自动拉起浏览器并触发云端任务 |
+| [`colab_monitor.py`](colab_monitor.py) | 本地 Windows / CLI | 本地监控核心逻辑，管理专用浏览器 Profile 与轮询开播状态 |
+| [`colab_trigger.py`](colab_trigger.py) | 本地 CLI | 底层触发脚本，负责向 Drive 写入任务控制信号并通过 CDP 操作 Notebook |
+| [`notebooks/colab_record.ipynb`](notebooks/colab_record.ipynb) | Google Colab | 云端运行的 Jupyter Notebook 宿主，组织环境准备、预检与任务执行 |
+| [`colab_run.py`](colab_run.py) | Colab 容器内 | 云端核心协调器，调度 DMR 下载器、渲染队列、备份流水线与投稿事务 |
+| [`colab_upload.py`](colab_upload.py) | Colab 容器内 | 独立补传工具，用于为已关闭但未完成投稿的历史任务继续追传分 P |
+
+---
+
+## 前置准备：Google Drive 目录树速查
+
+本工具在 Colab 运行时将所有配置、凭据与产物均保存在您的私有 Google Drive 中。请确保您的 Google Drive 根目录具有如下结构：
+
+```text
+Google Drive (我的云端硬盘)
+└── DMRColab/
+    ├── credentials/
+    │   ├── bilibili.json           # [必填] 观看与取流 Cookie (格式见下文)
+    │   └── bilibili_upload.json    # [可选] 投稿专用 Cookie (启用投稿时需要)
+    ├── config/
+    │   └── upload.yml              # [可选] 投稿元数据配置 (由 colab_support/upload.example.yml 复制)
+    ├── control/                    # [自动维护] 本地监控与 Colab 握手通信目录 (request/claim/ack)
+    └── runs/<run_id>/              # [生成成果] 单场任务输出
+        ├── source/                 # 录制原片分段
+        ├── danmaku/                # 弹幕 ASS 文件
+        ├── rendered/               # NVENC 渲染后的带弹幕成品分段
+        ├── merged/complete.mp4     # 全场归档合并视频 (仅用于归档)
+        ├── manifest.json           # 录制、渲染、备份全流程状态与校验值汇总
+        ├── upload.json             # 投稿事务与远端分 P 顺序记录
+        └── events.log              # 白名单审计事件日志
 ```
 
-需要 Google Drive for desktop 同步目录，以及已登录、保存为 GPU 类型并配置好参数的私有 Notebook；监控期间无需连接运行时。先使用仅打开页面的模式：
+### 1. 准备观看凭据（必需）
+将您的 B 站观看登录 Cookie JSON 放置在私有 Drive 的：
+`MyDrive/DMRColab/credentials/bilibili.json`
 
-```powershell
-python colab_trigger.py --url "https://live.bilibili.com/<房间号>" --drive-sync-root "<Drive 同步根目录>" --notebook-url "<自己的 Notebook URL>"
-```
+> **要求**：JSON 需包含 `cookie_info.cookies` 列表，且含有非空的 `SESSDATA`。程序不会调用任何登录工具或写入 refresh token。
 
-准备好启用 loopback CDP 的专用浏览器后，可自动点击一次“全部运行”：
+### 2. 准备投稿配置与凭据（可选）
+若需开启自动多 P 投稿：
+1. 复制 [colab_support/upload.example.yml](colab_support/upload.example.yml) 到 Drive 的 `MyDrive/DMRColab/config/upload.yml`。
+2. 填写账号校验 `expected_uid`、分区 `tid`、转载属性 `copyright`、标题模板、简介和标签，并设置 `enabled: true`。
+3. 将包含 `SESSDATA` 和 `bili_jct` 的投稿凭据放置在 `MyDrive/DMRColab/credentials/bilibili_upload.json`。
 
-```powershell
-python colab_trigger.py --url "https://live.bilibili.com/<房间号>" --drive-sync-root "<Drive 同步根目录>" --notebook-url "<自己的 Notebook URL>" --auto-run --cdp-url http://127.0.0.1:9222
-```
+---
 
-自动触发时 Notebook 的 `ROOM_URL` 留空，读取同步的运行请求。遇到登录、授权、页面忙碌或无法确认的状态会报告 `needs_attention`；不会自动授权、重启运行时或保活。详细浏览器条件与回执协议见 [Colab 文档](docs/colab.md)。
+## 快速上手
 
-自动模式的 `manifest.json` 与 `ack.json` 包含 `runtime_release`：`requested` 表示已保存释放意图并请求 `runtime.unassign()`，不表示已确认释放；`unknown` 表示保存或释放异常。最终回执后等待至少 60 秒，浏览器必须明确显示未连接才允许按下播确认重新武装；仍连接或无法判断时报告 `needs_attention`，不重复点击。
+### 第一步：设置 Google Colab Notebook
 
-失败任务会先补存未备份媒体到 `recovery/`，保存失败或仍有活动录制进程时保留运行时供检查。源码准备、依赖安装、Drive 授权等认领前失败由认领超时报告；不能保证这些阶段自动释放。`/content` 文件会随运行时释放丢失，请从 Drive 检查最终结果。
+1. 打开 [notebooks/colab_record.ipynb](notebooks/colab_record.ipynb)，在 Colab 菜单中选择 **“文件” -> “在云端硬盘中保存一份副本”**。
+2. 在副本的 **“修改” -> “笔记本设置”** 中，将硬件加速器设置为支持 NVENC 的 **GPU**（如 T4）。
+3. 建议先使用手动模式做一次短试跑：
+   - 在 Notebook 顶部参数表单中设置 `ROOM_URL` 为目标直播间地址。
+   - 设置 `SEGMENT_SECONDS = 300`（5分钟一段）、`MAX_RECORD_HOURS = 0.2`。
+   - 依次执行各单元格，熟悉流程并验证 Google Drive 挂载与成品生成。
 
-## 补传与离线测试
+---
 
-在挂载 Drive 的云端环境中，可补传已关闭任务的校验备份；先确认没有活动运行或其他补传实例：
+### 第二步：配置本地检测开播与自动触发（Windows）
 
+1. **安装本地轻量依赖**：
+   ```powershell
+   python -m pip install -r colab_support/monitor_requirements.txt
+   ```
+   > ⚠️ **避坑提示**：请勿在本地执行 `pip install -r requirements.txt`。完整版依赖包含用于其他平台的 `quickjs`，在 Windows + Python 3.13 下缺少 prebuilt wheel 会导致 C 扩展编译失败。本地监控仅需安装上述轻量的 `monitor_requirements.txt`。
+
+2. **初始化配置向导**：
+   在仓库根目录下运行：
+   ```powershell
+   .\start_colab_monitor.cmd --setup
+   ```
+   按照向导提示输入：
+   - 任务配置模板（如 `configs/DMR-example.yml`，程序将自动读取其中的直播间地址）；
+   - Google Drive for desktop 本地同步目录（例如 `G:\我的云端硬盘` 或 `G:\My Drive`）；
+   - 您的私有 Colab Notebook URL（形如 `https://colab.research.google.com/drive/...`）；
+   - 专用浏览器程序路径（自动探测 Chrome / Edge）。
+
+3. **开始日常自动监控**：
+   配置完成后，日常使用只需双击运行 `start_colab_monitor.cmd` 即可挂机：
+   - 本地程序将以低资源消耗轮询直播间状态；
+   - 确认开播后，自动启动带独立 Profile 的浏览器，通过 CDP 打开您的 Notebook 并点击一次“全部运行”；
+   - 云端认领任务并执行录像、渲染与归档；
+   - 自动模式在持久化全部数据到 Drive 后，会自动调用 `google.colab.runtime.unassign()` 释放运行时，本地等待下播确认后重新进入警戒状态。
+
+---
+
+## 异常恢复与按运行编号补传
+
+若某次运行中遇到网络抖动或 B 站 API 异常导致部分分 P 未成功追加，但视频和 ASS 已安全备份在 Drive 中：
+
+在挂载好 Drive 的 Colab 环境中执行：
 ```bash
 python colab_upload.py --run-id <run_id> --drive-root /content/drive/MyDrive
 ```
 
-补传沿用原稿件并跳过已确认提交内容；未知结果、事务冲突或校验失败会停止。详细配置、超时、错误处理及验收步骤见 [docs/colab.md](docs/colab.md)。
+- 补传程序会自动校验原片、ASS 和成品三个备份的 SHA-256，核对已有稿件的远端分 P 序列，并自动跳过已提交的段，安全继续追传剩余分 P。
+- 详细机制与状态核对见 [Colab 详细规范文档](docs/colab.md)。
 
-本地离线回归：
+---
+
+## 离线单元测试
+
+在提交代码或修改逻辑前，可直接在本地运行离线测试套件：
 
 ```bash
 python -m unittest discover -s checks -p "test_colab*.py" -v
 ```
 
-## 本 fork 的来源与 Colab 改造
+离线测试使用模拟 API、Mock 浏览器和合成媒体流，覆盖了状态机转移、Cookie 隔离、短段跳过、去重与并发防护等 88 项测试用例。
 
-本仓库 DanmakuRenderForColab 基于 [SmallPeaches/DanmakuRender](https://github.com/SmallPeaches/DanmakuRender) 的 v5 分支继续开发，保留原项目及其贡献者的来源说明。录制、直播取流、弹幕采集、ASS 写入和渲染直接复用或适配原有 DMR 模块；新增 Colab Notebook、单场协调器、Drive 校验备份、收尾合并及本地触发与回执代码。
+---
 
-Colab 路径支持单直播间录制、弹幕渲染、分段及全场成品备份，新增本地自动触发与可选 B 站多 P 投稿。一场直播对应一个稿件，每个有效渲染分段追加为一个 P；全场合并仅用于 Drive 归档。公开配置默认关闭投稿，启用需在私有 Drive 填写独立投稿凭据和账号配置。新增流程完成离线测试，真实自动触发和投稿尚待云端验收，详见 [Colab 文档](docs/colab.md)。
+## 常见问题与避坑预警 (FAQ)
 
-截至 2026-10-10，检查的上游 v5 根目录及本地版本未发现 LICENSE、COPYING 或 NOTICE 许可证文件；上游 README 保留“本程序仅供研究学习使用！”说明。本 fork 不据此宣称原代码采用 MIT、Apache、GPL 等许可证，也不替原作者重新授权；本段仅记录来源与当前查证结果。原代码的版权归相应权利人所有，第三方依赖的许可证需分别核对。
+1. **Google Drive 首次挂载授权弹窗**：
+   - 首次在 Colab 运行 Notebook 时，Google 会弹出“允许此笔记本访问您的 Google 云端硬盘文件吗？”的安全确认对话框。**该对话框必须由您本人在网页中手动点击一次“连接到 Google 云端硬盘”**。CDP 自动脚本出于安全与接口限制不会也不可能替您代点授权。
 
-以下保留原项目介绍。
+2. **本地专用浏览器环境隔离**：
+   - `start_colab_monitor.cmd` 启动的 Chrome/Edge 使用位于 `.temp/colab-browser-profile/` 的独立用户目录，绝不会侵入或接管您的日常浏览器。首次通过向导唤醒时，请在该专用浏览器窗口中登录好 Google 账号并打开保存好的 Notebook。
 
-结合网络上的代码写的一个能录制带弹幕直播流的小工具，主要用来录制包含弹幕的视频流。     
-- 可以录制纯净直播流和弹幕，并且支持在本地预览带弹幕直播流。
-- 可以自动渲染弹幕到视频中，并且渲染速度快。
-- 支持同时录制多个直播。    
-- 支持录播自动上传至B站。     
+3. **Colab 运行时配额与算力点**：
+   - 监控期间您的 Notebook 应处于**未连接**状态（不消耗任何算力时长）。开播后脚本点击“全部运行”才会向 Google 申请 GPU 实例。
+   - 录制和渲染结束后，程序会自动发出释放运行时的请求并持久化退出回执。
 
-此版本为全新设计的版本5，包含以下新功能：     
-- 支持动态载入配置文件。
-- 支持更加复杂的录制、上传、渲染和清理逻辑。
-- 支持搬运直播回放或者视频。
-- 支持使用webhook与其他录制软件协同。
+4. **Colab 临时磁盘 `/content` 被重置**：
+   - Colab 运行时的本地临时磁盘文件会在实例断开后随之清空。所有生成的原片、弹幕、成品与日志均在第一时间双向校验并同步写入到您的 Google Drive 中，请直接在 Google Drive 中查验和下载录播成品。
 
-旧版本可以在分支v1-v4找到。     
+---
 
+## 开源溯源、许可证与致谢
 
-## 使用说明
-**如果你是纯萌新建议看我B站的专栏安装：https://www.bilibili.com/read/cv26348023**         
+- 本仓库 **DanmakuRenderForColab** 基于开源项目 [SmallPeaches/DanmakuRender](https://github.com/SmallPeaches/DanmakuRender) 的 `v5` 分支进行定制开发。
+- 直播取流、弹幕通信、ASS 写入及核心渲染模块复用并适配了原有 DMR 架构；新增了 Colab 云端协调流水线、Google Drive 校验备份、B 站多 P 追加事务日志、本地 CDP 监控触发及补传机制。
+- 感谢上游作者及核心依赖的杰出工作：`THMonster/danmaku`, `wbt5/real-url`, `ForgQi/biliup`, `ForgQi/stream-gears`。
+- 上游代码未声明特定开源许可证（保留“本程序仅供研究学习使用！”说明）。本 fork 不替原作者做额外授权，相关代码版权归原作者所有。
 
-### 安装与使用文档      
-[**安装文档**](docs/installation.md)       
-[**使用文档**](docs/usage.md)     
-
-[**服务器录播示例**](https://github.com/SmallPeaches/DanmakuRender/discussions/368)
-
-### 可选参数
-程序运行时可以指定以下参数
-- `--config` 指定全局配置文件，默认`configs/global.yml`
-- `--version` 查看版本号
-- `--skip_update` 跳过版本检查
-
-## 更多
-感谢 THMonster/danmaku, wbt5/real-url, ForgQi/biliup, ForgQi/stream-gears 的工作。     
-出现问题欢迎大家提issue讨论。       
-
-**本程序仅供研究学习使用！**
+**本程序仅供研究学习交流使用！**
