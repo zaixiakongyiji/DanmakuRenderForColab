@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 from colab_support.trigger import (ColabLauncher, TriggerMonitor, TRIGGER_SCHEMA_VERSION,
     claim_request, control_paths, validate_room_url, validate_trigger_request, write_ack)
@@ -230,6 +230,77 @@ class TriggerTests(unittest.TestCase):
         state_file.write_text('[]', encoding='utf-8')
         self.assertFalse(reset_trigger_state_if_inactive('old.yml', 'new.yml', state_file))
         self.assertTrue(state_file.exists())
+
+    def test_cli_json_flag_and_logging_format(self):
+        import logging
+        import io
+        from contextlib import redirect_stdout
+        from colab_trigger import (
+            parser as trigger_parser,
+            format_trigger_message,
+            monitor_loop,
+            setup_logger,
+            resolve_target_info,
+        )
+        import colab_trigger
+        from colab_support.trigger import TriggerResult
+
+        args = trigger_parser().parse_args(['--url', 'https://live.bilibili.com/12345', '--json'])
+        self.assertTrue(args.json)
+
+        args_default = trigger_parser().parse_args(['--url', 'https://live.bilibili.com/12345'])
+        self.assertFalse(args_default.json)
+
+        logger = setup_logger()
+        self.assertEqual(logger.level, logging.INFO)
+        self.assertTrue(len(logger.handlers) >= 1)
+
+        target, room_id = resolve_target_info('https://live.bilibili.com/12345')
+        self.assertEqual(room_id, '12345')
+        self.assertTrue(len(target) > 0)
+
+        # 检查各状态消息格式化
+        level, msg = format_trigger_message(target, TriggerResult('offline'))
+        self.assertEqual(level, logging.INFO)
+        self.assertIn('直播未开播', msg)
+        self.assertIn(target, msg)
+
+        level, msg = format_trigger_message(target, TriggerResult('opened', triggered=True, run_id='run-123'))
+        self.assertEqual(level, logging.INFO)
+        self.assertIn('已成功触发 Colab 运行', msg)
+        self.assertIn('run-123', msg)
+
+        level, msg = format_trigger_message(target, TriggerResult('running', run_id='run-123'))
+        self.assertEqual(level, logging.INFO)
+        self.assertIn('Colab 正常运行中', msg)
+
+        level, msg = format_trigger_message(target, TriggerResult('needs_attention', run_id='run-123', error='claim_timeout'))
+        self.assertEqual(level, logging.WARNING)
+        self.assertIn('需人工关注', msg)
+        self.assertIn('Colab 认领请求超时', msg)
+
+        level, msg = format_trigger_message(target, TriggerResult('failed', run_id='run-123', error='oom'))
+        self.assertEqual(level, logging.ERROR)
+        self.assertIn('Colab 任务执行失败', msg)
+
+        args = trigger_parser().parse_args([
+            '--url', 'https://live.bilibili.com/12345', '--json', '--once',
+        ])
+        fake_monitor = Mock()
+        fake_monitor.return_value.observe.return_value = TriggerResult(
+            'opened', triggered=True, run_id='run-123')
+        output = io.StringIO()
+        with redirect_stdout(output), \
+                patch.object(colab_trigger, 'TriggerMonitor', fake_monitor), \
+                patch.object(colab_trigger, 'probe_bilibili', return_value=True), \
+                patch.object(colab_trigger, 'resolve_target_info', return_value=('房间 12345', '12345')), \
+                patch.object(colab_trigger, 'setup_logger', return_value=Mock()):
+            self.assertEqual(monitor_loop(args, args.url, Mock()), 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0]), {
+            'status': 'opened', 'triggered': True, 'run_id': 'run-123', 'error': None,
+        })
 
 
 if __name__ == '__main__':
