@@ -69,6 +69,8 @@ def _persist(session, result, release):
 
 def finish_session(session, returncode, *, failure=None, release_runtime=None):
     """先持久化结果再释放；保存失败或仍有进程时保留运行时和本地文件。"""
+    if session.preparation_active:
+        raise RuntimeError('preparation_heartbeat_still_active')
     if session.phase in {'release_requested', 'release_unknown'}:
         raise RuntimeError('runtime_release_already_attempted')
     local = session.run_dir / 'manifest.json'

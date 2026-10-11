@@ -267,7 +267,7 @@ class TriggerTests(unittest.TestCase):
 
         level, msg = format_trigger_message(target, TriggerResult('opened', triggered=True, run_id='run-123'))
         self.assertEqual(level, logging.INFO)
-        self.assertIn('已成功触发 Colab 运行', msg)
+        self.assertIn('已发送 Colab 运行请求，等待认领', msg)
         self.assertIn('run-123', msg)
 
         level, msg = format_trigger_message(target, TriggerResult('running', run_id='run-123'))
@@ -301,6 +301,57 @@ class TriggerTests(unittest.TestCase):
         self.assertEqual(json.loads(lines[0]), {
             'status': 'opened', 'triggered': True, 'run_id': 'run-123', 'error': None,
         })
+
+    def test_monitor_loop_deduplication_and_verbose(self):
+        from unittest.mock import Mock, patch
+        from colab_support.trigger import TriggerResult
+        import colab_trigger
+        from colab_trigger import parser as trigger_parser, monitor_loop
+
+        # 默认模式：相同状态日志去重
+        args_default = trigger_parser().parse_args([
+            '--url', 'https://live.bilibili.com/12345', '--once',
+        ])
+        fake_monitor = Mock()
+        fake_monitor.return_value.observe.side_effect = [
+            TriggerResult('offline'),
+            TriggerResult('offline'),
+            TriggerResult('opened', triggered=True, run_id='run-123'),
+        ]
+        mock_logger = Mock()
+        with patch.object(colab_trigger, 'TriggerMonitor', fake_monitor), \
+                patch.object(colab_trigger, 'probe_bilibili', return_value=True), \
+                patch.object(colab_trigger, 'resolve_target_info', return_value=('舍茶建乡', '12345')), \
+                patch.object(colab_trigger, 'setup_logger', return_value=mock_logger), \
+                patch('time.sleep', return_value=None):
+            self.assertEqual(monitor_loop(args_default, args_default.url, Mock()), 0)
+
+        # 连续两次 offline 只应记录 1 次，最后 opened (triggered) 记录 1 次，共 2 次 log
+        self.assertEqual(mock_logger.log.call_count, 2)
+        logged_msgs = [call.args[1] for call in mock_logger.log.call_args_list]
+        self.assertIn('直播未开播', logged_msgs[0])
+        self.assertIn('已发送 Colab 运行请求，等待认领', logged_msgs[1])
+
+        # verbose 模式：不进行去重，每轮都输出
+        args_verbose = trigger_parser().parse_args([
+            '--url', 'https://live.bilibili.com/12345', '--once', '--verbose',
+        ])
+        fake_monitor_verbose = Mock()
+        fake_monitor_verbose.return_value.observe.side_effect = [
+            TriggerResult('offline'),
+            TriggerResult('offline'),
+            TriggerResult('opened', triggered=True, run_id='run-123'),
+        ]
+        mock_logger_verbose = Mock()
+        with patch.object(colab_trigger, 'TriggerMonitor', fake_monitor_verbose), \
+                patch.object(colab_trigger, 'probe_bilibili', return_value=True), \
+                patch.object(colab_trigger, 'resolve_target_info', return_value=('舍茶建乡', '12345')), \
+                patch.object(colab_trigger, 'setup_logger', return_value=mock_logger_verbose), \
+                patch('time.sleep', return_value=None):
+            self.assertEqual(monitor_loop(args_verbose, args_verbose.url, Mock()), 0)
+
+        # verbose 模式下每轮都输出，共 3 次 log
+        self.assertEqual(mock_logger_verbose.log.call_count, 3)
 
 
 if __name__ == '__main__':

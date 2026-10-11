@@ -1,9 +1,52 @@
 """Notebook 参数、预检和运行的单次会话令牌。"""
 import math
-from dataclasses import dataclass
+import json
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .trigger import claim_request, control_paths, make_run_id, read_active_request, validate_room_url
+from .trigger import (claim_request, control_paths, make_run_id, read_active_request,
+                      validate_ack, validate_room_url, write_ack)
+
+
+class PreparationHeartbeat:
+    def __init__(self, session, phase, interval=30):
+        self.session, self.phase, self.interval = session, phase, interval
+        self.stop_event = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self._run, name='colab-preparation-heartbeat', daemon=True)
+
+    def update(self):
+        path = control_paths(self.session.drive_root, self.session.run_id)[2]
+        ack = json.loads(path.read_text(encoding='utf-8'))
+        validate_ack(ack, self.session.run_id)
+        if ack['status'] != 'accepted' or self.stop_event.is_set():
+            return False
+        write_ack(path, self.session.run_id, 'accepted', phase=self.phase)
+        return True
+
+    def _run(self):
+        while not self.stop_event.wait(self.interval):
+            try:
+                if not self.update():
+                    return
+            except Exception:
+                self.error = 'preparation_heartbeat_failed'
+                return
+
+    def start(self):
+        if not self.update():
+            raise RuntimeError('notebook_preparation_ack_invalid')
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise RuntimeError('preparation_heartbeat_stop_failed')
+        if self.error:
+            raise RuntimeError(self.error)
 
 
 @dataclass
@@ -16,12 +59,52 @@ class NotebookSession:
     command: tuple
     phase: str = 'parameters'
     automatic: bool = False
+    _heartbeat: object = field(default=None, init=False, repr=False, compare=False)
+
+    @property
+    def preparation_active(self):
+        return self._heartbeat is not None and self._heartbeat.thread.is_alive()
+
+    @contextmanager
+    def preparation(self, phase):
+        heartbeat = PreparationHeartbeat(self, phase) if self.automatic else None
+        self._heartbeat = heartbeat
+        try:
+            if heartbeat:
+                heartbeat.start()
+            try:
+                yield
+            finally:
+                if heartbeat and heartbeat.thread.ident is not None:
+                    heartbeat.stop()
+        except BaseException:
+            self.phase = 'invalid'
+            if self.automatic and not self.preparation_active:
+                try:
+                    write_ack(control_paths(self.drive_root, self.run_id)[2], self.run_id,
+                              'failed', 'notebook_' + phase + '_failed', phase=phase)
+                except OSError:
+                    print('准备阶段失败回执无法保存，请检查 Drive；保留运行时。', flush=True)
+            raise
+
+    def install_dependencies(self, checked):
+        if self.phase != 'parameters':
+            raise RuntimeError('notebook_parameter_order_invalid')
+        self.phase = 'invalid'
+        with self.preparation('dependencies'):
+            checked(['apt-get', 'update', '-qq'])
+            checked(['apt-get', 'install', '-y', 'ffmpeg', 'fontconfig', 'fonts-noto-cjk'])
+            checked([self.command[0], '-m', 'pip', 'install', '-r',
+                     str(self.project / 'colab_support/requirements.txt')])
+            checked(['fc-cache', '-f'])
+        self.phase = 'parameters'
 
     def preflight(self, checked):
         if self.phase != 'parameters':
             raise RuntimeError('notebook_parameter_order_invalid')
         self.phase = 'invalid'
-        checked(list(self.command) + ['--preflight-only'], cwd=self.project)
+        with self.preparation('preflight'):
+            checked(list(self.command) + ['--preflight-only'], cwd=self.project)
         self.phase = 'preflight'
 
     def run(self, runner):
@@ -41,6 +124,8 @@ def prepare_session(project, drive_root, cookie, room_url, executable, *, segmen
     with ProcessLock(Path(work_root) / 'colab-runtime.lock'):
         pass
     trigger = None if room_url.strip() else read_active_request(drive_root)
+    if not room_url.strip() and trigger is None:
+        raise ValueError('trigger_request_missing')
     if trigger:
         room_url, run_id = trigger['room_url'], trigger['run_id']
     else:

@@ -168,7 +168,7 @@ class ReleaseTests(unittest.TestCase):
         self.session.preflight = Mock(side_effect=RuntimeError('preflight'))
         with patch('colab_support.runtime_release.finish_session') as finish:
             with self.assertRaises(RuntimeError):
-                exec(cells['colab-08'], {'SESSION': self.session, 'checked': Mock()})
+                exec(cells['colab-08'], {'SESSION': self.session, 'checked': Mock(), 'SETUP_PHASE': 'dependencies'})
             finish.assert_called_once_with(self.session, 1, failure='notebook_preflight_failed')
         self.session.phase = 'release_requested'
         with patch('colab_support.notebook.run_recording') as runner:

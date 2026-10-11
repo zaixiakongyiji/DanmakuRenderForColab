@@ -13,13 +13,35 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+from .drive_authorization import DriveAuthorizationWatcher, RUN_ALL_BUTTON, click_drive_dialog
+
 DEFAULT_NOTEBOOK_URL = (
     "https://colab.research.google.com/github/zaixiakongyiji/"
     "DanmakuRenderForColab/blob/codex/colab-poc/notebooks/colab_record.ipynb"
 )
 TRIGGER_SCHEMA_VERSION = 2
+TRIGGER_CLAIM_SECONDS = 900
 RUN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
 ACK_STATES = {"accepted", "running", "draining", "success", "failed"}
+CONNECTED_BUTTON = re.compile(
+    r'^(已连接|已連線|已連接|Connected)(\s|$)|RAM.*(磁盘|磁碟|硬碟|Disk)|'
+    r'(显示|顯示).*(RAM|内存|記憶體).*使用|Show.*RAM.*usage', re.I)
+CONNECT_BUTTON = re.compile(
+    r'^(连接|連線|連接|Connect|重新连接|重新連線|重新連接|Reconnect|连接到托管运行时|'
+    r'連線至託管執行階段|連線至代管執行階段|Connect to hosted runtime)(\s.*)?$', re.I)
+
+
+def validate_ack(payload, run_id, now=None):
+    if (not isinstance(payload, dict) or payload.get('schema_version') != TRIGGER_SCHEMA_VERSION
+            or payload.get('run_id') != run_id or payload.get('status') not in ACK_STATES):
+        raise ValueError('ack_invalid')
+    try:
+        updated = datetime.fromisoformat(payload['updated_at'].replace('Z', '+00:00'))
+        if updated.tzinfo is None or updated > (now or _utc_now()) + timedelta(seconds=60):
+            raise ValueError()
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise ValueError('ack_invalid') from None
+    return updated
 
 
 def control_paths(root, run_id):
@@ -111,7 +133,7 @@ def validate_trigger_request(payload: dict, now: Optional[datetime] = None) -> d
         raise ValueError("trigger_expiry_invalid")
     try:
         created = datetime.fromisoformat(str(payload['triggered_at']).replace('Z', '+00:00'))
-        if created.tzinfo is None or expires <= created or expires - created > timedelta(minutes=15):
+        if created.tzinfo is None or expires <= created or expires - created > timedelta(seconds=TRIGGER_CLAIM_SECONDS):
             raise ValueError()
         if created > (now or _utc_now()) + timedelta(seconds=60):
             raise ValueError()
@@ -124,13 +146,15 @@ def validate_trigger_request(payload: dict, now: Optional[datetime] = None) -> d
             "expires_at": expires.isoformat(), "source": str(payload.get("source", ""))}
 
 
-def write_ack(path: Path, run_id: str, status: str, error: Optional[str] = None) -> None:
+def write_ack(path: Path, run_id: str, status: str, error: Optional[str] = None, *, phase=None) -> None:
     if status not in ACK_STATES:
         raise ValueError("ack_status_invalid")
     value = {"schema_version": TRIGGER_SCHEMA_VERSION, "run_id": run_id,
              "status": status, "updated_at": _utc_now().isoformat()}
     if error:
         value["error"] = error
+    if phase:
+        value['phase'] = phase
     atomic_json(Path(path), value)
 
 
@@ -222,13 +246,16 @@ class ColabLauncher:
                  drive_sync_root: Optional[Path] = None,
                  open_browser: bool = True,
                  browser: Callable[[str], bool] = webbrowser.open_new_tab,
-                 auto_run: bool = False, cdp_url: Optional[str] = None):
+                 auto_run: bool = False, cdp_url: Optional[str] = None, google_account: str = ''):
         self.notebook_url = notebook_url
         self.drive_sync_root = Path(drive_sync_root) if drive_sync_root else None
         self.open_browser = open_browser
         self.browser = browser
         self.auto_run = auto_run
         self.cdp_url = cdp_url
+        self.google_account = google_account
+        self.authorization = None
+        self._pending_run = None
         if auto_run:
             if not self.drive_sync_root or not open_browser:
                 raise ValueError("auto_run_requires_drive_and_browser")
@@ -239,7 +266,7 @@ class ColabLauncher:
             request, claim, ack = control_paths(self.drive_sync_root, run_id)
             if request.exists() or claim.exists() or ack.exists():
                 raise RuntimeError('trigger_request_exists')
-            expires = (datetime.fromisoformat(triggered_at) + timedelta(minutes=15)).isoformat()
+            expires = (datetime.fromisoformat(triggered_at) + timedelta(seconds=TRIGGER_CLAIM_SECONDS)).isoformat()
             value = validate_trigger_request({'schema_version': TRIGGER_SCHEMA_VERSION,
                 'room_url': room_url, 'run_id': run_id, 'triggered_at': triggered_at,
                 'expires_at': expires, 'source': 'local_colab_trigger'},
@@ -248,6 +275,7 @@ class ColabLauncher:
             atomic_json(self.drive_sync_root / 'DMRColab/control/active.json',
                         {'schema_version': TRIGGER_SCHEMA_VERSION, 'run_id': run_id})
         if self.open_browser and self.auto_run:
+            self._pending_run = (run_id, datetime.fromisoformat(triggered_at).timestamp() + TRIGGER_CLAIM_SECONDS)
             if not self._auto_run_browser():
                 raise RuntimeError("browser_auto_run_needs_attention")
         elif self.open_browser and not self.browser(self.notebook_url):
@@ -269,60 +297,46 @@ class ColabLauncher:
                     page.goto(self.notebook_url, wait_until="domcontentloaded")
                 # 等待“全部运行”按钮渲染可见，避免 SPA 加载时差误判
                 try:
-                    btn = page.get_by_role('button', name=re.compile(r'^(全部运行|Run all)(\s|$)', re.I))
+                    btn = page.get_by_role('button', name=RUN_ALL_BUTTON)
                     btn.first.wait_for(state="visible", timeout=30000)
                 except Exception:
                     pass
                 if not self._click_run_all(page):
                     return False
-                # 点击全部运行后，自动等待并确认 Google 云端硬盘挂载授权
-                self._wait_and_authorize_drive(page, timeout=90)
+                # 监听不阻塞监控主线程，认领回执到达或请求过期时停止。
+                self.try_authorize_drive()
                 return True
         except Exception:
             return False
-
-    @classmethod
-    def _wait_and_authorize_drive(cls, page, timeout=90, interval=2):
-        """点击全部运行后，轮询等待并自动确认 Google 云端硬盘挂载授权。"""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                if cls._click_authorize_drive(page):
-                    time.sleep(3)
-                    return True
-            except Exception:
-                pass
-            time.sleep(interval)
-        return False
 
     @staticmethod
     def _click_authorize_drive(page) -> bool:
-        """如果页面存在 Drive 授权确认按钮，点击并返回 True。"""
         try:
-            btn = page.get_by_role('button', name=re.compile(r'^(连接到 Google 云端硬盘|Connect to Google Drive)$', re.I))
-            if btn.count() >= 1 and btn.first.is_visible():
-                btn.first.click(timeout=5000)
-                return True
+            return click_drive_dialog(page)
         except Exception:
-            pass
-        return False
+            return False
 
     def try_authorize_drive(self) -> bool:
-        """检查并自动点击 Colab 中的 Google 云端硬盘授权弹窗。"""
-        if not self.auto_run or not self.cdp_url:
+        """启动或恢复专用监听线程，由该线程每两秒扫描一次。"""
+        if not self.auto_run or not self.cdp_url or self._pending_run is None:
             return False
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as pw:
-                browser = pw.chromium.connect_over_cdp(self.cdp_url)
-                pages = [p for context in browser.contexts for p in context.pages]
-                base = self.notebook_url.split('#', 1)[0]
-                page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
-                if page is None:
-                    return False
-                return self._click_authorize_drive(page)
-        except Exception:
+        run_id, expires = self._pending_run
+        if time.time() >= expires:
             return False
+        if self.authorization is None or not self.authorization.thread.is_alive():
+            ack_path = control_paths(self.drive_sync_root, run_id)[2]
+            self.authorization = DriveAuthorizationWatcher(self.notebook_url, self.cdp_url,
+                self.google_account, expires, ack_path, run_id)
+            self.authorization.start()
+        return True
+
+    def close(self):
+        self._pending_run = None
+        if self.authorization is not None:
+            if self.authorization.stop():
+                self.authorization = None
+            else:
+                self.authorization.error = 'authorization_stop_timeout'
 
     @staticmethod
     def _click_run_all(page):
@@ -330,17 +344,17 @@ class ColabLauncher:
         # 不搜索整页正文，Notebook 源码自身可能含 running 等状态字样。
         text = '\n'.join(page.get_by_role('alert').all_text_contents() +
                          page.get_by_role('status').all_text_contents())
-        if re.search(r'需要授权|授权访问|正在执行|运行中|连接中|重新连接|Sign in|Authorize|Reconnect|Connecting|Running', text, re.I):
+        if re.search(r'需要授权|需要授權|授权访问|授權存取|正在执行|正在執行|运行中|執行中|连接中|連線中|重新连接|重新連線|重新連接|Sign in|Authorize|Reconnect|Connecting|Running', text, re.I):
             return False
-        login = page.get_by_role('button', name=re.compile(r'^(登录|Sign in)$', re.I))
+        login = page.get_by_role('button', name=re.compile(r'^(登录|登入|Sign in)$', re.I))
         if login.count() and login.first.is_visible():
             return False
         if page.get_by_role('dialog').count():
             return False
-        stop = page.get_by_role('button', name=re.compile(r'停止执行|中断执行|Interrupt execution|Stop execution', re.I))
+        stop = page.get_by_role('button', name=re.compile(r'停止执行|中断执行|停止執行|中斷執行|Interrupt execution|Stop execution', re.I))
         if stop.count():
             return False
-        button = page.get_by_role('button', name=re.compile(r'^(全部运行|Run all)(\s|$)', re.I))
+        button = page.get_by_role('button', name=RUN_ALL_BUTTON)
         if button.count() != 1 or not button.is_enabled() or not button.is_visible():
             return False
         button.click(timeout=5000)
@@ -367,12 +381,10 @@ class ColabLauncher:
     def _connection_state(page):
         if page.get_by_role('dialog').count():
             return None
-        connected = page.get_by_role('button', name=re.compile(
-            r'^(已连接|Connected)(\s|$)|RAM.*(磁盘|Disk)|显示.*(RAM|内存).*使用|Show.*RAM.*usage', re.I))
+        connected = page.get_by_role('button', name=CONNECTED_BUTTON)
         if connected.count() == 1 and connected.is_visible():
             return True
-        connect = page.get_by_role('button', name=re.compile(
-            r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|Connect to hosted runtime)(\s.*)?$', re.I))
+        connect = page.get_by_role('button', name=CONNECT_BUTTON)
         if connect.count() == 1 and connect.is_visible() and connect.is_enabled():
             return False
         try:
@@ -382,13 +394,9 @@ class ColabLauncher:
                 tooltip = connect_btn.first.get_attribute('tooltiptext') or ''
                 for label in (text, tooltip):
                     label = label.strip()
-                    if re.search(
-                            r'^(已连接|Connected)(\s|$)|RAM.*(磁盘|Disk)|'
-                            r'显示.*(RAM|内存).*使用|Show.*RAM.*usage', label, re.I):
+                    if CONNECTED_BUTTON.search(label):
                         return True
-                    if re.search(
-                            r'^(连接|Connect|重新连接|Reconnect|连接到托管运行时|'
-                            r'Connect to hosted runtime)(\s.*)?$', label, re.I):
+                    if CONNECT_BUTTON.search(label):
                         return False
         except Exception:
             pass
@@ -429,12 +437,21 @@ class TriggerMonitor:
                 self.state.save(self.state_file)
                 return TriggerResult(self.state.status, run_id=self.state.run_id, error=self.state.last_error)
             if self.state.triggered_at and self.state.ack_status is None:
-                if hasattr(self.launcher, 'try_authorize_drive'):
-                    self.launcher.try_authorize_drive()
                 try:
                     age = (stamp - datetime.fromisoformat(self.state.triggered_at)).total_seconds()
-                    if age >= 900:
+                    if age >= TRIGGER_CLAIM_SECONDS:
+                        self.launcher.close()
                         self.state.status, self.state.last_error = 'needs_attention', 'claim_timeout'
+                    elif self.state.status in {'opened', 'needs_attention'} and self.state.last_error not in {
+                            'launch_state_unknown', 'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}:
+                        self.launcher._pending_run = (self.state.run_id,
+                            datetime.fromisoformat(self.state.triggered_at).timestamp() + TRIGGER_CLAIM_SECONDS)
+                        self.launcher.try_authorize_drive()
+                        auth = self.launcher.authorization
+                        if auth is not None and auth.error:
+                            self.state.status, self.state.last_error = 'needs_attention', auth.error
+                        elif self.state.last_error and self.state.last_error.startswith(('google_', 'authorization_')):
+                            self.state.status, self.state.last_error = 'opened', None
                 except ValueError:
                     self.state.status, self.state.last_error = 'needs_attention', 'trigger_state_invalid'
             self.state.save(self.state_file)
@@ -476,12 +493,9 @@ class TriggerMonitor:
             return
         try:
             ack = json.loads(path.read_text(encoding='utf-8'))
-            if ack.get('schema_version') != TRIGGER_SCHEMA_VERSION or ack.get('run_id') != run_id or ack.get('status') not in ACK_STATES:
-                raise ValueError()
-            updated = datetime.fromisoformat(ack['updated_at'].replace('Z', '+00:00'))
-            if updated.tzinfo is None or updated > now + timedelta(seconds=60):
-                raise ValueError()
+            updated = validate_ack(ack, run_id, now)
             self.state.ack_status = ack['status']
+            self.launcher.close()
             self.state.status, self.state.last_error = ack['status'], ack.get('error')
             if ack.get('error') and ack['status'] not in {'success', 'failed'}:
                 self.state.status = 'needs_attention'

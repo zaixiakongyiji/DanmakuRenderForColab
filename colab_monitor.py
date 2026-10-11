@@ -58,6 +58,8 @@ def validate_settings(value):
     for key in ('task_config', 'drive_sync_root', 'notebook_url', 'browser', 'cdp_url'):
         if not isinstance(value.get(key), str) or not value[key].strip():
             raise ValueError('本地启动设置缺少字段：' + key)
+    if not isinstance(value.get('google_account', ''), str):
+        raise ValueError('Google 账号设置无效，请用 --setup 重新配置。')
     task_room(value['task_config'])
     drive = Path(value['drive_sync_root'])
     if not drive.is_absolute() or not drive.is_dir():
@@ -113,6 +115,7 @@ def setup(old=None):
         'notebook_url': prompt('私有 Colab Notebook 地址', old.get('notebook_url', '')),
         'browser': prompt('Chrome/Edge 程序路径', old.get('browser', find_browser())),
         'cdp_url': prompt('专用浏览器 CDP 地址', old.get('cdp_url', 'http://127.0.0.1:9222')),
+        'google_account': prompt('Google 账号邮箱（留空仅自动选择唯一账号）', old.get('google_account', '')),
     }
     validate_settings(value)
     atomic_json(SETTINGS, value)
@@ -174,7 +177,7 @@ def trigger_command(value):
             '--url', task_room(value['task_config']),
             '--drive-sync-root', value['drive_sync_root'],
             '--notebook-url', value['notebook_url'], '--auto-run',
-            '--cdp-url', value['cdp_url']]
+            '--cdp-url', value['cdp_url'], '--google-account', value.get('google_account', '')]
 
 
 def main(argv=None):

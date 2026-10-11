@@ -25,6 +25,14 @@ FRIENDLY_ERRORS = {
     "ack_invalid": "回执文件无效或损坏",
     "probe_unavailable": "网络探测不可用",
     "trigger_state_invalid": "触发器状态文件损坏",
+    "google_account_ambiguous": "Google 页面有多个账号，请指定 --google-account 或手动选择",
+    "google_account_mismatch": "Google 页面没有配置的账号，请检查专用浏览器登录",
+    "google_account_unconfirmed": "无法确认授权页面账号，请手动核对",
+    "google_login_required": "Google 需要登录，请在专用浏览器完成登录",
+    "google_auth_challenge": "Google 需要验证码或二次验证，请在专用浏览器完成",
+    "google_auth_page_unrecognized": "Google 授权页面无法识别，请手动检查",
+    "authorization_browser_unavailable": "授权监听无法连接专用浏览器，下一轮重试",
+    "authorization_stop_timeout": "授权监听尚未退出，请检查专用浏览器",
 }
 
 
@@ -62,7 +70,7 @@ def format_trigger_message(target_name: str, result: TriggerResult) -> tuple[int
     error_info = f"，原因: {error_desc}" if error_desc else ""
 
     if result.triggered:
-        return logging.INFO, f"[{target_name}] 检测到直播开始！已成功触发 Colab 运行{run_info}"
+        return logging.INFO, f"[{target_name}] 检测到直播开始！已发送 Colab 运行请求，等待认领{run_info}"
 
     state = result.state
     if state == "offline":
@@ -101,10 +109,12 @@ def parser():
     p.add_argument("--live-confirmations", type=int, default=2)
     p.add_argument("--offline-confirmations", type=int, default=3)
     p.add_argument("--no-browser", action="store_true", help="只写控制文件，不打开浏览器")
-    p.add_argument("--once", action="store_true", help="触发一次后退出")
+    p.add_argument("--once", action="store_true", help="触发一次后退出；自动点击模式等待认领后退出")
     p.add_argument("--auto-run", action="store_true", help="连接专用 loopback CDP 浏览器并点击一次 Run all")
     p.add_argument("--cdp-url", help="专用浏览器 loopback CDP 地址")
+    p.add_argument("--google-account", default='', help="Drive 授权所用 Google 账号邮箱；留空仅自动选择唯一账号")
     p.add_argument("--json", action="store_true", help="使用原始 JSON 格式输出状态日志（用于自动化脚本解析）")
+    p.add_argument("--verbose", action="store_true", help="每次轮询均输出日志（即使状态未变化）")
     return p
 
 
@@ -114,10 +124,13 @@ def main():
     if args.poll_seconds <= 0:
         raise ValueError("轮询间隔必须为正数")
     launcher = ColabLauncher(args.notebook_url, args.drive_sync_root, not args.no_browser,
-                             auto_run=args.auto_run, cdp_url=args.cdp_url)
+                             auto_run=args.auto_run, cdp_url=args.cdp_url, google_account=args.google_account)
     from colab_support.locks import ProcessLock
-    with ProcessLock(args.state_file.with_suffix('.lock')):
-        return monitor_loop(args, room_url, launcher)
+    try:
+        with ProcessLock(args.state_file.with_suffix('.lock')):
+            return monitor_loop(args, room_url, launcher)
+    finally:
+        launcher.close()
 
 
 def monitor_loop(args, room_url, launcher):
@@ -131,6 +144,8 @@ def monitor_loop(args, room_url, launcher):
         logger.info(f"轮询间隔: {args.poll_seconds:.0f}s，开播判定: 连续{args.live_confirmations}次，下播判定: 连续{args.offline_confirmations}次")
         logger.info("本地 Colab 触发器已启动；查询失败不会判定为下播。")
 
+    last_log_signature = None
+
     while True:
         result = monitor.observe(probe_bilibili(room_url))
         if args.json:
@@ -138,10 +153,21 @@ def monitor_loop(args, room_url, launcher):
                               "run_id": result.run_id, "error": result.error}, ensure_ascii=False), flush=True)
         else:
             level, msg = format_trigger_message(target_name, result)
-            logger.log(level, msg)
+            signature = (result.state, result.triggered, result.run_id, result.error)
+            verbose = getattr(args, 'verbose', False)
+            if verbose or signature != last_log_signature:
+                logger.log(level, msg)
+                last_log_signature = signature
 
-        if args.once and result.triggered:
-            return 0
+        if args.once:
+            if result.triggered and not args.auto_run:
+                return 0
+            if args.auto_run:
+                if monitor.state.ack_status is not None:
+                    return 1 if monitor.state.ack_status == 'failed' else 0
+                if result.error in {'claim_timeout', 'launch_state_unknown', 'active_run_conflict',
+                                    'ack_invalid', 'trigger_state_invalid'}:
+                    return 1
         time.sleep(args.poll_seconds)
 
 
