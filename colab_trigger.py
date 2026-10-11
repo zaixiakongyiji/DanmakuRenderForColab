@@ -16,7 +16,7 @@ from colab_support.trigger import (
 )
 
 FRIENDLY_ERRORS = {
-    "claim_timeout": "Colab 认领请求超时（请检查 Notebook 是否在运行）",
+    "claim_timeout": "Colab 认领请求超时；核实旧任务未运行后停止监控，执行 start_colab_monitor.cmd --recover-expired 恢复",
     "runtime_heartbeat_stale": "Colab 运行心跳超时",
     "runtime_release_unconfirmed": "Colab 运行时释放未确认",
     "runtime_release_pending": "等待 Colab 释放运行时",
@@ -113,6 +113,7 @@ def parser():
     p.add_argument("--auto-run", action="store_true", help="连接专用 loopback CDP 浏览器并点击一次 Run all")
     p.add_argument("--cdp-url", help="专用浏览器 loopback CDP 地址")
     p.add_argument("--google-account", default='', help="Drive 授权所用 Google 账号邮箱；留空仅自动选择唯一账号")
+    p.add_argument("--recover-expired", action="store_true", help="核实旧任务未运行后，归档未认领的过期请求状态并恢复监控")
     p.add_argument("--json", action="store_true", help="使用原始 JSON 格式输出状态日志（用于自动化脚本解析）")
     p.add_argument("--verbose", action="store_true", help="每次轮询均输出日志（即使状态未变化）")
     return p
@@ -137,6 +138,12 @@ def monitor_loop(args, room_url, launcher):
     monitor = TriggerMonitor(room_url, launcher, args.state_file,
                              args.live_confirmations, args.offline_confirmations)
     logger = setup_logger()
+    if getattr(args, 'recover_expired', False):
+        archive = monitor.recover_expired()
+        if args.json:
+            print(json.dumps({'status': 'recovered', 'archive': str(archive)}, ensure_ascii=False), flush=True)
+        else:
+            logger.info('已归档未认领的过期请求状态：%s；重新确认开播状态。', archive)
     target_name, room_id = resolve_target_info(room_url)
 
     if not args.json:

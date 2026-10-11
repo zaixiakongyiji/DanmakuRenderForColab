@@ -12,6 +12,7 @@ from pathlib import Path
 from .core import atomic_json
 from .locks import ProcessLock
 from .upload_config import load_upload_config
+from .diagnostics import upload_exception_diagnostic
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -119,13 +120,17 @@ class PostingWorker:
                 if part['status'] == 'submitted':
                     return journal.result(key)
                 status = 'unknown' if part['status'] in ('submitting', 'unknown') else 'failed'
-                part.update(status=status, error=code)
+                part.update(status=status, error=code, diagnostic=upload_exception_diagnostic(
+                    TimeoutError() if code == 'upload_timeout' else RuntimeError(),
+                    part.get('stage', 'unknown')))
                 journal.save()
                 return journal.result(key)
         except Exception:
             # 持久化结果未知时不能声称可以安全重传。
             return {'status': 'unknown', 'error': 'upload_journal_unavailable'}
-        return {'status': 'failed', 'error': code}
+        return {'status': 'failed', 'error': code,
+                'diagnostic': upload_exception_diagnostic(
+                    TimeoutError() if code == 'upload_timeout' else RuntimeError(), 'unknown')}
 
 
 def execute_job(job):
@@ -143,13 +148,15 @@ def execute_job(job):
         if part and part['status'] == 'submitted':
             return {'status': 'failed', 'error': code}
         if part:
-            part.update(status='unknown' if part['status'] in ('submitting', 'unknown') else 'failed', error=code)
+            part.update(status='unknown' if part['status'] in ('submitting', 'unknown') else 'failed', error=code,
+                        diagnostic=upload_exception_diagnostic(error, part.get('stage', 'unknown')))
             try:
                 journal.save()
                 return journal.result(job['key'])
             except Exception:
                 return {'status': 'unknown', 'error': 'upload_journal_persistence_failed'}
-        return {'status': 'failed', 'error': code}
+        return {'status': 'failed', 'error': code,
+                'diagnostic': upload_exception_diagnostic(error, 'unknown')}
 
 
 def main():

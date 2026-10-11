@@ -170,6 +170,7 @@ class TriggerState:
     last_poll_at: Optional[str] = None
     last_error: Optional[str] = None
     ack_status: Optional[str] = None
+    notebook_url: Optional[str] = None
 
     @classmethod
     def load(cls, path: Path, room_url: str) -> "TriggerState":
@@ -178,6 +179,9 @@ class TriggerState:
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if payload.get('schema_version') != TRIGGER_SCHEMA_VERSION:
+                raise ValueError()
+            if payload.get('notebook_url') is not None and (
+                    not isinstance(payload['notebook_url'], str) or not payload['notebook_url'].strip()):
                 raise ValueError()
             valid_statuses = {'unknown', 'offline', 'probe_unavailable', 'live', 'dispatching',
                     'needs_attention', 'opened', 'accepted', 'running', 'draining', 'success', 'failed', 'ended'}
@@ -360,7 +364,7 @@ class ColabLauncher:
         button.click(timeout=5000)
         return True
 
-    def runtime_connection_state(self):
+    def runtime_connection_state(self, notebook_url=None):
         """返回 True=明确连接、False=明确未连接、None=无法判断。"""
         if not self.auto_run or not self.cdp_url:
             return None
@@ -369,7 +373,7 @@ class ColabLauncher:
             with sync_playwright() as pw:
                 browser = pw.chromium.connect_over_cdp(self.cdp_url)
                 pages = [p for context in browser.contexts for p in context.pages]
-                base = self.notebook_url.split('#', 1)[0]
+                base = (notebook_url or self.notebook_url).split('#', 1)[0]
                 page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
                 if page is None:
                     return None
@@ -419,6 +423,58 @@ class TriggerMonitor:
         self.state = TriggerState.load(self.state_file, self.room_url)
         self.state.save(self.state_file)
 
+    def recover_expired(self):
+        """显式恢复未认领的过期请求；调用方须持有监控状态进程锁。"""
+        state = self.state
+        if (state.status not in {'opened', 'needs_attention'} or state.last_error not in {None, 'claim_timeout'}
+                or not state.triggered or not state.run_id or state.ack_status is not None):
+            raise ValueError('恢复失败：只有认领超时且未收到回执的请求可以恢复。')
+        if not self.launcher.drive_sync_root:
+            raise ValueError('恢复失败：需要可读取的 Drive 同步目录。')
+        try:
+            created = datetime.fromisoformat(state.triggered_at)
+            now = datetime.fromtimestamp(self.now(), timezone.utc)
+            request, claim, ack = control_paths(self.launcher.drive_sync_root, state.run_id)
+            payload = validate_trigger_request(json.loads(request.read_text(encoding='utf-8')), created)
+            if (payload['run_id'] != state.run_id or payload['room_url'] != self.room_url
+                    or datetime.fromisoformat(payload['triggered_at']) != created):
+                raise ValueError()
+            if datetime.fromisoformat(payload['expires_at']) > now:
+                raise ValueError()
+        except (OSError, ValueError, TypeError, AttributeError):
+            raise ValueError('恢复失败：无法核实旧请求已过期，请检查 Drive 同步和请求文件。') from None
+        def require_unclaimed():
+            for path in (claim, ack):
+                try:
+                    path.stat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    raise ValueError('恢复失败：无法检查认领和回执文件，请检查 Drive 同步。') from None
+                raise ValueError('恢复失败：旧请求已有认领或回执，不能按未启动任务重置。')
+
+        require_unclaimed()
+        connected = (self.launcher.runtime_connection_state(notebook_url=state.notebook_url)
+                     if state.notebook_url else self.launcher.runtime_connection_state())
+        if connected is not False:
+            raise ValueError('恢复失败：旧 Notebook 仍连接或无法确认状态，请先检查旧任务和运行时。')
+        self.launcher.close()
+        if self.launcher.authorization is not None:
+            raise ValueError('恢复失败：旧授权监听尚未退出。')
+        require_unclaimed()
+        # 仅归档本地状态，保留 Drive 的过期请求供核对；不延长有效期。
+        archive = self.state_file.with_name(
+            self.state_file.stem + '.expired-' + state.run_id + '.bak.json')
+        try:
+            with archive.open('x', encoding='utf-8') as stream:
+                stream.write(self.state_file.read_text(encoding='utf-8'))
+            fresh = TriggerState(self.room_url)
+            fresh.save(self.state_file)
+        except OSError:
+            raise ValueError('恢复失败：无法归档本地状态，请检查备份文件和目录权限。') from None
+        self.state = fresh
+        return archive
+
     def observe(self, status: Optional[bool]) -> TriggerResult:
         stamp = datetime.fromtimestamp(self.now(), timezone.utc)
         self.state.last_poll_at = stamp.isoformat()
@@ -465,6 +521,7 @@ class TriggerMonitor:
             if self.state.live_streak >= self.live_confirmations:
                 run_id = make_run_id(stamp)
                 self.state.status, self.state.run_id = 'dispatching', run_id
+                self.state.notebook_url = self.launcher.notebook_url.split('#', 1)[0]
                 self.state.triggered_at = stamp.isoformat()
                 # 保存不可自动重试的启动意图，再调用浏览器。
                 self.state.save(self.state_file)

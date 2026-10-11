@@ -8,11 +8,14 @@ import shutil
 import subprocess
 import tempfile
 import time
+from fractions import Fraction
 from pathlib import Path
 
 
 class MergeError(RuntimeError):
-    pass
+    def __init__(self, code, *, differences=None):
+        super().__init__(code)
+        self.differences = differences or []
 
 
 def remaining(deadline):
@@ -55,13 +58,90 @@ def probe(path, ffprobe, deadline):
             raise ValueError()
         fields = ('codec_type', 'codec_name', 'codec_tag_string', 'profile', 'level',
                   'width', 'height', 'pix_fmt', 'sample_aspect_ratio', 'time_base',
-                  'sample_rate', 'channels', 'channel_layout', 'extradata_hash')
+                  'sample_rate', 'channels', 'channel_layout', 'extradata_hash', 'r_frame_rate')
         signature = [{key: s.get(key) for key in fields} for s in streams]
         if any(not s.get('codec_name') or not s.get('time_base') for s in streams):
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise MergeError('merge_invalid_media') from None
     return duration, signature
+
+
+def video_frame_rate(signature):
+    try:
+        video = next(s for s in signature if s.get('codec_type') == 'video')
+        rate = Fraction(video['r_frame_rate'])
+        if not 1 <= rate <= 120:
+            raise ValueError()
+        return str(rate)
+    except (StopIteration, KeyError, TypeError, ValueError, ZeroDivisionError):
+        raise MergeError('merge_invalid_frame_rate') from None
+
+
+def video_encoding_args(rate, encoder):
+    options = ['-b:v', '15M'] if encoder == 'h264_nvenc' else ['-crf', '18', '-preset', 'fast']
+    return options + ['-r', rate, '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p',
+                      '-profile:v', 'main', '-video_track_timescale', '90000']
+
+
+def stream_differences(inputs, signatures):
+    reference = signatures[0]
+    differences = []
+    for (key, _), current in zip(inputs[1:], signatures[1:]):
+        if len(current) != len(reference):
+            differences.append({'segment': key, 'fields': ['stream_count']})
+            continue
+        for index, (expected, actual) in enumerate(zip(reference, current)):
+            if not isinstance(expected, dict) or not isinstance(actual, dict):
+                if expected != actual:
+                    differences.append({'segment': key, 'stream_index': index,
+                                        'fields': ['signature']})
+                continue
+            fields = sorted(field for field in expected.keys() | actual.keys()
+                            if expected.get(field) != actual.get(field))
+            if fields:
+                differences.append({'segment': key, 'stream_index': index, 'fields': fields})
+    return differences
+
+
+def normalize_inputs(inputs, signatures, durations, folder, deadline, ffmpeg, ffprobe, encoder,
+                     min_free_gib):
+    reference = signatures[0]
+    if not all(isinstance(stream, dict) for signature in signatures for stream in signature):
+        raise MergeError('merge_incompatible_streams', differences=stream_differences(inputs, signatures))
+    # 只处理同规格 H.264/AAC 的时间及编码头差异，不猜测分辨率或声道变化的处理方式。
+    stable_fields = ('codec_type', 'codec_name', 'width', 'height', 'pix_fmt',
+                     'sample_aspect_ratio', 'sample_rate', 'channels', 'channel_layout')
+    valid = (sum(s.get('codec_type') == 'video' for s in reference) == 1 and
+             sum(s.get('codec_type') == 'audio' for s in reference) <= 1 and
+             all(s.get('codec_name') == {'video': 'h264', 'audio': 'aac'}.get(s.get('codec_type'))
+                 for s in reference))
+    if not valid or any(len(current) != len(reference) or any(
+            any(a.get(field) != b.get(field) for field in stable_fields)
+            for a, b in zip(reference, current)) for current in signatures[1:]):
+        raise MergeError('merge_incompatible_streams', differences=stream_differences(inputs, signatures))
+    rate = video_frame_rate(reference)
+    # 标准化临时文件和最终归档同时存在，按输出码率预留两份空间。
+    estimated_size = max(sum(path.stat().st_size for _, path in inputs),
+                         math.ceil(sum(durations) * 16_000_000 / 8))
+    if shutil.disk_usage(folder).free < math.ceil(estimated_size * 2.2) + int(min_free_gib * 1024**3):
+        raise MergeError('merge_disk_low')
+    normalized, signature = [], None
+    for index, ((key, path), duration) in enumerate(zip(inputs, durations)):
+        target = folder / f'{index}.mp4'
+        command = [ffmpeg, '-nostdin', '-n', '-hide_banner', '-v', 'error', '-i', str(path),
+                   '-map', '0:v:0', '-map', '0:a:0?', '-c:v', encoder,
+                   *video_encoding_args(rate, encoder), '-c:a', 'aac', '-b:a', '192k',
+                   '-movflags', '+faststart', str(target)]
+        media_command(command, deadline)
+        actual, current = probe(target, ffprobe, deadline)
+        if abs(actual - duration) > max(0.25, 2 / float(Fraction(rate))):
+            raise MergeError('merge_normalization_duration_mismatch')
+        if signature is not None and current != signature:
+            raise MergeError('merge_normalization_stream_mismatch')
+        signature = current
+        normalized.append((key, target))
+    return normalized, signature
 
 
 def probe_hwaccel_cuda(ffmpeg, target, deadline):
@@ -185,13 +265,28 @@ def merge_rendered(run_dir, manifest, deadline, *, min_free_gib=10,
     required = math.ceil(total_size * 1.1) + int(min_free_gib * 1024**3)
     if shutil.disk_usage(folder).free < required:
         raise MergeError('merge_disk_low')
-    durations, signature = [], None
+    durations, signatures = [], []
     for _, path in inputs:
         duration, current = probe(path, ffprobe, deadline)
-        if signature is not None and current != signature:
-            raise MergeError('merge_incompatible_streams')
-        signature = current
+        signatures.append(current)
         durations.append(duration)
+    differences = stream_differences(inputs, signatures)
+    encoder = 'h264_nvenc' if manifest.get('settings', {}).get('encoder') == 'h264_nvenc' else 'libx264'
+    with tempfile.TemporaryDirectory(prefix='normalized-', dir=folder) as temporary:
+        signature = signatures[0]
+        if differences:
+            inputs, signature = normalize_inputs(inputs, signatures, durations, Path(temporary),
+                deadline, ffmpeg, ffprobe, encoder, min_free_gib)
+        result = concatenate(inputs, signature, durations, folder, partial, output, deadline,
+                             ffmpeg, ffprobe)
+    result.update(mode='normalized_stream_copy' if differences else 'stream_copy',
+                  stream_differences=differences, elapsed_seconds=time.monotonic() - started)
+    if differences:
+        result['normalization_encoder'] = encoder
+    return result
+
+
+def concatenate(inputs, signature, durations, folder, partial, output, deadline, ffmpeg, ffprobe):
     # 使用相对路径和标准 ffconcat 转义，支持空格及单引号，不拷贝第二套输入。
     def quote(path):
         value = Path(os.path.relpath(path, folder)).as_posix()
@@ -201,10 +296,14 @@ def merge_rendered(run_dir, manifest, deadline, *, min_free_gib=10,
     playlist = folder / 'concat.txt'
     playlist.write_text('ffconcat version 1.0\n' + ''.join(
         'file ' + quote(path) + '\n' for _, path in inputs), encoding='utf-8')
-    media_command([ffmpeg, '-nostdin', '-n', '-hide_banner', '-v', 'warning',
+    command = [ffmpeg, '-nostdin', '-n', '-hide_banner', '-v', 'warning',
                    '-f', 'concat', '-safe', '0', '-i', playlist.name,
-                   '-map', '0', '-c', 'copy', '-movflags', '+faststart', partial.name],
-                  deadline, cwd=folder)
+                   '-map', '0', '-c', 'copy', '-movflags', '+faststart']
+    video = next(s for s in signature if s['codec_type'] == 'video')
+    timescale = Fraction(video['time_base'])
+    if timescale.numerator == 1:
+        command.extend(['-video_track_timescale', str(timescale.denominator)])
+    media_command(command + [partial.name], deadline, cwd=folder)
     actual, merged_signature = probe(partial, ffprobe, deadline)
     expected = sum(durations)
     tolerance = max(1.0, 0.1 * len(inputs))
@@ -217,12 +316,11 @@ def merge_rendered(run_dir, manifest, deadline, *, min_free_gib=10,
     remaining(deadline)
     partial.replace(output)
     return {'status': 'success', 'mode': 'stream_copy',
-            'path': output.relative_to(Path(run_dir)).as_posix(),
+            'path': output.relative_to(folder.parent).as_posix(),
             'segments': [key for key, _ in inputs], 'segment_count': len(inputs),
             'expected_duration_seconds': expected, 'duration_seconds': actual,
             'duration_tolerance_seconds': tolerance, 'size': output.stat().st_size,
-            'decode_verified': True, 'decode_mode': decode_mode,
-            'elapsed_seconds': time.monotonic() - started}
+            'decode_verified': True, 'decode_mode': decode_mode}
 
 
 def finalize_merge(coordinator, events, deadline, *, min_free_gib=10,
@@ -246,6 +344,8 @@ def finalize_merge(coordinator, events, deadline, *, min_free_gib=10,
         except Exception as error:
             code = str(error) if isinstance(error, MergeError) else 'merge_failed'
             state.update(status='error', error=code, backup={'status': 'skipped'})
+            if isinstance(error, MergeError) and error.differences:
+                state['stream_differences'] = error.differences
             coordinator.error(code)
             coordinator.checkpoint()
         else:

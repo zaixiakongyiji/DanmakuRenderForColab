@@ -13,7 +13,7 @@ from pathlib import Path
 from .core import BackupWorker, Coordinator, atomic_json
 from .cli import ROOT, preflight, prepare_cookie, prepare_upload
 from .diagnostics import safe_diagnostic
-from .merge import finalize_merge, remaining
+from .merge import finalize_merge, remaining, probe, video_frame_rate, video_encoding_args
 
 
 def run(args):
@@ -57,10 +57,7 @@ def run(args):
     ToolsList.set('ffmpeg', shutil.which('ffmpeg'))
     ToolsList.set('ffprobe', shutil.which('ffprobe'))
 
-    render_args = copy.deepcopy(defaults['render_args']['dmrender'])
-    render_args.update(hwaccel_args=[], vencoder='h264_nvenc', vencoder_args=['-b:v', '15M'],
-                       aencoder='copy', aencoder_args=[], output_resize=None,
-                       advanced_render_args={}, ffmpeg=shutil.which('ffmpeg'))
+    render_args = None
     class ColabRender(Render):
         def _render_subprocess(self, task):
             self._pipeSend('start', '', target=task['source'], request_id=task['request_id'])
@@ -69,6 +66,16 @@ def run(args):
     renderer = ColabRender((events, queue.Queue()), nrenders=1)
     # 直接 add_task，不启动队列监控线程，也不加载宿主插件。
     def submit(request_id, video, output):
+        nonlocal render_args
+        if render_args is None:
+            _, signature = probe(video['path'], shutil.which('ffprobe'), time.monotonic() + 30)
+            rate = video_frame_rate(signature)
+            render_args = copy.deepcopy(defaults['render_args']['dmrender'])
+            render_args.update(hwaccel_args=[], vencoder='h264_nvenc',
+                vencoder_args=video_encoding_args(rate, 'h264_nvenc'),
+                aencoder='copy', aencoder_args=[], output_resize=None,
+                advanced_render_args={}, ffmpeg=shutil.which('ffmpeg'))
+            coordinator.manifest['settings'].update(render_frame_rate=rate, video_track_timescale=90000)
         renderer.add_task(PipeMessage('colab', 'render', 'newtask', request_id=request_id, data={
             'mode': 'dmrender', 'video': video, 'output': str(output), 'args': render_args}))
 

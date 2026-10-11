@@ -172,17 +172,21 @@ def ensure_browser(value, prepare=False):
     raise ValueError('浏览器 CDP 未就绪，请检查专用浏览器。未启动监控或发出录制请求。')
 
 
-def trigger_command(value):
-    return [sys.executable, '-u', str(ROOT / 'colab_trigger.py'),
+def trigger_command(value, recover_expired=False):
+    command = [sys.executable, '-u', str(ROOT / 'colab_trigger.py'),
             '--url', task_room(value['task_config']),
             '--drive-sync-root', value['drive_sync_root'],
             '--notebook-url', value['notebook_url'], '--auto-run',
             '--cdp-url', value['cdp_url'], '--google-account', value.get('google_account', '')]
+    if recover_expired:
+        command.append('--recover-expired')
+    return command
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='一键启动本地 Colab 开播监控。')
     parser.add_argument('--setup', action='store_true', help='重新设置启动参数，保留监控状态')
+    parser.add_argument('--recover-expired', action='store_true', help='核实旧任务未运行后，归档未认领的过期请求状态并恢复监控')
     args = parser.parse_args(argv)
     if importlib.util.find_spec('playwright') is None:
         raise ValueError('缺少 Playwright。请先执行：python -m pip install -r colab_support/monitor_requirements.txt')
@@ -193,7 +197,7 @@ def main(argv=None):
         print('监控目标：', task_room(value['task_config']))
         print('默认每 60 秒检查一次，连续两次开播后自动点击一次全部运行。Ctrl+C 停止本地监控。')
         print('本入口只读取任务的直播间；录制与投稿设置使用 Notebook 表单和私有 Drive 配置。')
-        return subprocess.call(trigger_command(value), cwd=ROOT)
+        return subprocess.call(trigger_command(value, args.recover_expired), cwd=ROOT)
 
 
 if __name__ == '__main__':

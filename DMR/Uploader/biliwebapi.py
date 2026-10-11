@@ -32,6 +32,55 @@ from .biliuprs import biliuprs
 logger = logging.getLogger(__name__)
 
 
+class MediaUploadError(RuntimeError):
+    def __init__(self, stage, category, *, http_status=None, api_code=None, attempts=None):
+        super().__init__('media_upload_failed')
+        self.diagnostic = {'stage': stage, 'category': category}
+        for key, value in (('http_status', http_status), ('api_code', api_code), ('attempts', attempts)):
+            if type(value) is int:
+                self.diagnostic[key] = value
+
+
+def media_failure(error, stage, *, attempts=None):
+    if isinstance(error, MediaUploadError):
+        if type(attempts) is int:
+            error.diagnostic['attempts'] = attempts
+        return error
+    if isinstance(error, requests.exceptions.Timeout):
+        category = 'timeout'
+    elif isinstance(error, requests.exceptions.SSLError):
+        category = 'tls_error'
+    elif isinstance(error, requests.exceptions.ConnectionError):
+        category = 'connection_error'
+    elif isinstance(error, (ValueError, KeyError, TypeError)):
+        category = 'invalid_response'
+    elif isinstance(error, OSError):
+        category = 'io_error'
+    else:
+        category = 'unexpected_error'
+    return MediaUploadError(stage, category, attempts=attempts)
+
+
+def media_json(response, stage):
+    status = response.status_code
+    if type(status) is int and not 200 <= status < 300:
+        raise MediaUploadError(stage, 'http_error', http_status=status)
+    try:
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError()
+        return data
+    except (ValueError, TypeError):
+        raise MediaUploadError(stage, 'invalid_response', http_status=status) from None
+
+
+def media_request(request, stage, *args, **kwargs):
+    try:
+        return media_json(request(*args, **kwargs), stage)
+    except Exception as error:
+        raise media_failure(error, stage) from None
+
+
 class BiliWebApi:
     def __init__(self,
         cookies:str=None,
@@ -98,8 +147,10 @@ class BiliWebApi:
             return r['data']['hash'], rsa.PublicKey.load_pkcs1_openssl_pem(r['data']['key'].encode())
 
     def probe(self):
-        ret = self._session.get('https://member.bilibili.com/preupload?r=probe', timeout=5).json()
-        logger.debug(f"线路:{ret['lines']}")
+        ret = media_request(self._session.get, 'line_probe',
+                            'https://member.bilibili.com/preupload?r=probe', timeout=5)
+        if not isinstance(ret.get('lines'), list) or not isinstance(ret.get('probe'), dict):
+            raise MediaUploadError('line_probe', 'invalid_response', api_code=ret.get('code'))
         data, auto_os = None, None
         min_cost = 0
         if ret['probe'].get('get'):
@@ -107,16 +158,28 @@ class BiliWebApi:
         else:
             method = 'post'
             data = bytes(int(1024 * 0.1 * 1024))
+        last_error = MediaUploadError('line_probe', 'no_available_line')
         for line in ret['lines']:
+            if (not isinstance(line, dict) or line.get('os') != 'upos' or
+                    not isinstance(line.get('probe_url'), str) or not isinstance(line.get('query'), str)):
+                continue
             start = time.perf_counter()
-            test = self._session.request(method, f"https:{line['probe_url']}", data=data, timeout=30)
+            try:
+                test = self._session.request(method, f"https:{line['probe_url']}", data=data,
+                                             timeout=5 if getattr(self, 'readonly_cookies', False) else 30)
+                if test.status_code != 200:
+                    last_error = MediaUploadError('line_probe', 'http_error', http_status=test.status_code)
+                    continue
+            except requests.exceptions.RequestException as error:
+                last_error = media_failure(error, 'line_probe')
+                continue
             cost = time.perf_counter() - start
             # logger.debug(line['query'], cost)
-            if test.status_code != 200:
-                return
             if not min_cost or min_cost > cost:
-                auto_os = line
+                auto_os = dict(line)
                 min_cost = cost
+        if auto_os is None:
+            raise last_error
         auto_os['cost'] = min_cost
         return auto_os
     
@@ -302,10 +365,13 @@ class BiliWebApi:
 
     def upload_media(self, filepath, lines='AUTO'):
         """仅传输媒体，返回远端标识；不创建或修改稿件。"""
-        status, part = self.upload_stream(filepath, os.path.basename(filepath),
-                                        os.path.getsize(filepath), lines=lines, media_only=True)
+        try:
+            status, part = self.upload_stream(filepath, os.path.basename(filepath),
+                                            os.path.getsize(filepath), lines=lines, media_only=True)
+        except Exception as error:
+            raise media_failure(error, 'media_transfer') from None
         if not status:
-            raise RuntimeError('media_upload_failed')
+            raise MediaUploadError('media_transfer', 'transfer_failed')
         return part
 
     def upload_file(
@@ -368,18 +434,23 @@ class BiliWebApi:
             'name': file_name,
             'size': total_size,
         }
-        resp = self._session.get(
+        ret = media_request(self._session.get, 'preupload',
             f"https://member.bilibili.com/preupload?{self._auto_os['query']}", params=query,
             timeout=5)
-        ret = resp.json()
-        if "chunk_size" not in ret:
+        if type(ret.get('chunk_size')) is not int or ret['chunk_size'] <= 0:
+            if media_only:
+                raise MediaUploadError('preupload', 'server_rejected', api_code=ret.get('code'))
             # stop_event.set()
             return False, f"预上传失败: {ret}"
         logger.debug(f"preupload: {ret}")
+        if (any(not isinstance(ret.get(key), str) or not ret[key] for key in
+                ('auth', 'endpoint', 'upos_uri')) or not ret['endpoint'].startswith('//') or
+                not ret['upos_uri'].startswith('upos://') or 'biz_id' not in ret):
+            raise MediaUploadError('preupload', 'invalid_response')
         if preferred_upos_cdn:
             # 如果返回的endpoint不在probe_url中，则尝试在endpoints中校验probe_url是否可用
             if ret['endpoint'] not in self._auto_os['probe_url']:
-                for endpoint in ret['endpoints']:
+                for endpoint in ret.get('endpoints', []):
                     if endpoint in self._auto_os['probe_url']:
                         ret['endpoint'] = endpoint
                         logger.info(f"修改endpoint: {ret['endpoint']}")
@@ -417,8 +488,11 @@ class BiliWebApi:
             "X-Upos-Auth": auth
         }
         # 向上传地址申请上传，得到上传id等信息
-        upload_id = self._session.post(f'{url}?uploads&output=json', timeout=15,
-                                        headers=headers).json()["upload_id"]
+        init = media_request(self._session.post, 'upload_init',
+                             f'{url}?uploads&output=json', timeout=15, headers=headers)
+        upload_id = init.get('upload_id')
+        if not isinstance(upload_id, str) or not upload_id:
+            raise MediaUploadError('upload_init', 'invalid_response')
         # 开始上传
         parts = []  # 分块信息
         chunks = math.ceil(total_size / chunk_size)  # 获取分块数量
@@ -484,12 +558,19 @@ class BiliWebApi:
         attempt = 1
         while attempt <= 3:  # 一旦放弃就会丢失前面所有的进度，多试几次吧
             try:
-                r = self._session.post(url, params=p, json={"parts": parts}, headers=headers, timeout=15).json()
+                r = media_request(self._session.post, 'media_finalize', url, params=p,
+                                  json={"parts": parts}, headers=headers, timeout=15)
                 if r.get('OK') == 1:
                     logger.info(f'{file_name} uploaded >> {n / 1000 / 1000:.2f}MB, {n / 1000 / 1000 / cost:.2f}MB/s. {r}')
                     return {"title": splitext(file_name)[0], "filename": splitext(basename(upos_uri))[0], "desc": ""}
-                raise IOError(r)
-            except IOError:
+                raise MediaUploadError('media_finalize', 'server_rejected', api_code=r.get('code'))
+            except (IOError, MediaUploadError) as error:
+                failure = media_failure(error, 'media_finalize', attempts=attempt)
+                status = failure.diagnostic.get('http_status', 0)
+                if attempt == 3 or (400 <= status < 500 and status != 429):
+                    if not getattr(self, 'readonly_cookies', False):
+                        return None
+                    raise failure from None
                 logger.info(f"请求合并分片 {file_name} 时出现问题，尝试重连，次数：" + str(attempt))
                 attempt += 1
                 time.sleep(10)
@@ -517,23 +598,36 @@ class BiliWebApi:
                 # 如果上传失败，但未达到最大重试次数，等待一段时间后重试
                 else:
                     retries += 1
+                    failure = MediaUploadError('chunk_upload', 'http_error', http_status=r.status_code,
+                                               attempts=retries)
+                    if 400 <= r.status_code < 500 and r.status_code != 429:
+                        if not getattr(self, 'readonly_cookies', False):
+                            return None
+                        raise failure
                     logger.warning(
                         f"{file_name} - chunks-{params_clone['chunk']} - up failed: {r.status_code}. Retrying {retries}/{max_retries}")
 
                     # 计算退避时间，逐步增加重试间隔
                     backoff_time = backoff_factor ** retries
-                    time.sleep(backoff_time)
+                    if retries < max_retries:
+                        time.sleep(backoff_time)
 
+            except MediaUploadError:
+                raise
             except Exception as e:
                 retries += 1
-                logger.error(f"upload_chunk_thread err {str(e)}. Retrying {retries}/{max_retries}")
+                failure = media_failure(e, 'chunk_upload', attempts=retries)
+                logger.error(f"upload_chunk_thread {failure.diagnostic['category']}. Retrying {retries}/{max_retries}")
 
                 # 计算退避时间，逐步增加重试间隔
                 backoff_time = backoff_factor ** retries
-                time.sleep(backoff_time)
+                if retries < max_retries:
+                    time.sleep(backoff_time)
 
         # 如果重试了所有次数仍然失败，记录错误
         logger.error(f"{file_name} - chunks-{params_clone['chunk']} - Upload failed after {max_retries} attempts.")
+        if getattr(self, 'readonly_cookies', False):
+            raise failure
         return None
 
     def file_reader_generator(self, filepath: str, chunk_size: int):

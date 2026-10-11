@@ -10,13 +10,16 @@ from pathlib import Path
 
 from .core import atomic_json, digest, verified_copy
 from .upload_config import load_upload_cookie
+from .diagnostics import upload_exception_diagnostic
 
 SHANGHAI = timezone(timedelta(hours=8), 'Asia/Shanghai')
 BVID = re.compile(r'^BV[0-9A-Za-z]{10}$')
 
 
 class UploadError(RuntimeError):
-    pass
+    def __init__(self, code, diagnostic=None):
+        super().__init__(code)
+        self.diagnostic = diagnostic
 
 
 class Journal:
@@ -67,7 +70,8 @@ class Journal:
 
     def result(self, key):
         part = self.data['parts'][key]
-        fields = ('status', 'error', 'part_index', 'filename', 'cid', 'elapsed_seconds', 'sha256', 'size')
+        fields = ('status', 'error', 'part_index', 'filename', 'cid', 'elapsed_seconds', 'sha256', 'size',
+                  'diagnostic', 'stage', 'transfer_attempts')
         return dict({k: part[k] for k in fields if k in part}, bvid=self.data['bvid'], aid=self.data['aid'])
 
 
@@ -91,8 +95,8 @@ class ColabBiliUploader:
                 raise UploadError('upload_identity_mismatch')
         except UploadError:
             raise
-        except Exception:
-            raise UploadError('upload_auth_unavailable') from None
+        except Exception as error:
+            raise UploadError('upload_auth_unavailable', upload_exception_diagnostic(error, 'identity')) from None
 
     def metadata(self, segment, path):
         from DMR.utils import StreamerInfo, VideoInfo
@@ -153,6 +157,7 @@ class ColabBiliUploader:
             journal.data['aid'] = aid
         part.update(status='submitted', cid=remote.videos[-1].get('cid'))
         part.pop('error', None)
+        part.pop('diagnostic', None)
         journal.save()
         return True
 
@@ -192,6 +197,7 @@ class ColabBiliUploader:
             raise UploadError('upload_previous_part_blocked')
         if not current:
             current = parts[key] = {'status': 'pending', 'part_index': index, 'sha256': checksum, 'size': size}
+        current['stage'] = 'metadata'
         if not journal.data.get('metadata'):
             journal.data['metadata'] = self.metadata(segment, path)
         remote = None
@@ -202,14 +208,32 @@ class ColabBiliUploader:
         elif index != 1:
             raise UploadError('upload_bvid_missing')
         if not current.get('filename'):
-            current.update(status='uploading')
-            journal.save()
-            transferred = self.api.upload_media(str(path), lines=self.config['line'])
-            filename = transferred.get('filename')
+            for attempt in range(1, 4):
+                current.update(status='uploading', stage='media_transfer', transfer_attempts=attempt)
+                journal.save()
+                try:
+                    transferred = self.api.upload_media(str(path), lines=self.config['line'])
+                    break
+                except Exception as error:
+                    diagnostic = upload_exception_diagnostic(error, 'media_transfer')
+                    current['diagnostic'] = diagnostic
+                    journal.save()
+                    retryable = diagnostic.get('category') in {'timeout', 'connection_error', 'transfer_failed'}
+                    if diagnostic.get('category') == 'http_error':
+                        retryable = diagnostic.get('http_status') == 429 or diagnostic.get('http_status', 0) >= 500
+                    if attempt == 3 or not retryable:
+                        raise UploadError('upload_media_transfer_failed', diagnostic) from None
+                    if self.config['line'] == 'AUTO':
+                        self.api._auto_os = None
+                    # 仅重试媒体传输；稿件创建及追加 POST 始终不自动重试。
+                    time.sleep(2 ** attempt)
+            filename = transferred.get('filename') if isinstance(transferred, dict) else None
             if not isinstance(filename, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', filename):
                 raise UploadError('upload_remote_identifier_invalid')
             current.update(status='uploaded', filename=filename)
+            current.pop('diagnostic', None)
             journal.save()
+        current['stage'] = 'identity'
         self.check_identity()
         new_part = {'filename': current['filename'],
                     'title': part_title if part_title is not None else 'P' + str(index), 'desc': ''}
@@ -221,7 +245,7 @@ class ColabBiliUploader:
         payload['bvid'] = journal.data['bvid']
         payload['videos'] = ([{k: v for k, v in p.items() if k in ('filename', 'title', 'desc', 'cid')}
                               for p in remote.videos] if remote else []) + [new_part]
-        current.update(status='submitting', expected_filenames=[v['filename'] for v in payload['videos']],
+        current.update(status='submitting', stage='submit', expected_filenames=[v['filename'] for v in payload['videos']],
                        operation_id=uuid.uuid4().hex, intent_at=datetime.now(SHANGHAI).isoformat(),
                        operation='append' if journal.data['bvid'] else 'create',
                        elapsed_seconds=time.monotonic() - started)
@@ -233,7 +257,8 @@ class ColabBiliUploader:
                 raise UploadError('upload_submit_unresolved')
             if response['code'] != 0:
                 # 服务端明确拒绝，不能在锁定/删除后退回新建。
-                current.update(status='failed', error='upload_submit_rejected', submission_rejected=True)
+                current.update(status='failed', error='upload_submit_rejected', submission_rejected=True,
+                    diagnostic={'stage': 'submit', 'category': 'server_rejected', 'api_code': response['code']})
                 journal.save()
                 return journal.result(key)
             result = response.get('data', {})
@@ -245,8 +270,9 @@ class ColabBiliUploader:
             if isinstance(aid, int) and aid > 0:
                 journal.data['aid'] = aid
             journal.save()
-        except Exception:
-            current.update(status='unknown', error='upload_submit_unresolved')
+        except Exception as error:
+            current.update(status='unknown', error='upload_submit_unresolved',
+                           diagnostic=upload_exception_diagnostic(error, 'submit'))
             journal.save()
         try:
             confirmed = self.reconcile(journal, key)

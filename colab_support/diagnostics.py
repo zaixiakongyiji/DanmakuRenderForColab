@@ -47,3 +47,49 @@ def safe_diagnostic(data):
     if type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0:
         result['elapsed_seconds'] = round(elapsed, 3)
     return result
+
+
+UPLOAD_STAGES = frozenset(('unknown', 'metadata', 'identity', 'media_transfer', 'line_probe',
+    'preupload', 'upload_init', 'chunk_upload', 'media_finalize', 'submit', 'reconcile', 'journal'))
+UPLOAD_CATEGORIES = frozenset(('timeout', 'connection_error', 'tls_error', 'http_error',
+    'io_error', 'invalid_response', 'server_rejected', 'transfer_failed', 'no_available_line',
+    'unexpected_error'))
+UPLOAD_ERROR_TYPES = ERROR_TYPES | frozenset(('UploadError', 'MediaUploadError', 'ReadTimeout',
+    'ConnectTimeout', 'HTTPError', 'SSLError', 'JSONDecodeError', 'KeyError', 'TypeError'))
+
+
+def safe_upload_diagnostic(data):
+    data = data if isinstance(data, dict) else {}
+    stage = data.get('stage')
+    result = {'stage': stage if isinstance(stage, str) and stage in UPLOAD_STAGES else 'unknown'}
+    category = data.get('category')
+    if isinstance(category, str) and category in UPLOAD_CATEGORIES:
+        result['category'] = category
+    error_type = data.get('error_type')
+    if isinstance(error_type, str):
+        result['error_type'] = error_type if error_type in UPLOAD_ERROR_TYPES else 'Error'
+    for key in ('http_status', 'api_code', 'attempts'):
+        value = data.get(key)
+        if type(value) is int and (key != 'http_status' or 100 <= value <= 599):
+            result[key] = value
+    return result
+
+
+def upload_exception_diagnostic(error, stage):
+    supplied = getattr(error, 'diagnostic', None)
+    data = dict(supplied) if isinstance(supplied, dict) else {}
+    data.setdefault('stage', stage)
+    name = type(error).__name__
+    data['error_type'] = name
+    if 'category' not in data:
+        if isinstance(error, TimeoutError) or name in ('ReadTimeout', 'ConnectTimeout', 'Timeout'):
+            data['category'] = 'timeout'
+        elif name == 'ConnectionError':
+            data['category'] = 'connection_error'
+        elif name == 'SSLError':
+            data['category'] = 'tls_error'
+        elif isinstance(error, OSError):
+            data['category'] = 'io_error'
+        else:
+            data['category'] = 'unexpected_error'
+    return safe_upload_diagnostic(data)

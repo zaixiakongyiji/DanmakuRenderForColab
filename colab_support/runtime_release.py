@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from .core import atomic_json, digest, verified_copy
 from .locks import ProcessLock
 from .trigger import TRIGGER_SCHEMA_VERSION, control_paths
+from .diagnostics import safe_upload_diagnostic
 
 
 def _timestamp():
@@ -26,6 +27,12 @@ def summarize(session):
     print('录制备份:', result.get('recording_backup'), '合并:', result.get('merge', {}).get('status'),
           '投稿:', result.get('upload', {}).get('status'))
     print('失败项:', result.get('errors', []), '投稿失败项:', result.get('upload_errors', []))
+    for key, segment in result.get('segments', {}).items():
+        upload = segment.get('upload', {})
+        if upload.get('diagnostic'):
+            print('投稿诊断:', key, safe_upload_diagnostic(upload['diagnostic']))
+    if result.get('merge', {}).get('stream_differences'):
+        print('合并分段参数差异:', result['merge']['stream_differences'])
     print('Drive 备份目录:', session.backup_dir, flush=True)
     return result
 

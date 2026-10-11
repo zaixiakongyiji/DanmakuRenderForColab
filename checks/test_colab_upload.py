@@ -178,6 +178,73 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(UploadError, 'journal_invalid'):
             Journal(self.journal.local, self.journal.remote, 'test', 1)
 
+    def execute(self):
+        from colab_support.posting import execute_job
+        with patch('colab_support.posting.load_upload_config', return_value=CONFIG), \
+             patch('colab_support.upload_transaction.ColabBiliUploader', return_value=self.uploader):
+            return execute_job({'config_file': 'unused', 'cookie': 'unused',
+                'local': str(self.journal.local), 'remote': str(self.journal.remote), 'run_id': 'test',
+                'path': str(self.path), 'metadata': self.segment, 'part_index': 1, 'key': 's-1'})
+
+    def test_transient_media_failure_retries_then_submits_once(self):
+        from DMR.Uploader.biliwebapi import MediaUploadError
+        self.api.upload_media.side_effect = [MediaUploadError('preupload', 'timeout'),
+                                            {'filename': 'remote1'}]
+        with patch('colab_support.upload_transaction.time.sleep'):
+            result = self.execute()
+        self.assertEqual(result['status'], 'submitted')
+        self.assertEqual(result['transfer_attempts'], 2)
+        self.assertEqual(self.api.upload_media.call_count, 2)
+        self.assertEqual(self.api.submit_web.call_count, 1)
+        self.assertNotIn('diagnostic', result)
+        self.assertIsNone(self.api._auto_os)
+
+    def test_failed_transfer_preserves_stage_and_stops_before_submit(self):
+        from DMR.Uploader.biliwebapi import MediaUploadError
+        self.api.upload_media.side_effect = MediaUploadError('chunk_upload', 'http_error',
+                                                             http_status=503, attempts=3)
+        with patch('colab_support.upload_transaction.time.sleep'):
+            result = self.execute()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error'], 'upload_media_transfer_failed')
+        self.assertEqual(result['diagnostic']['stage'], 'chunk_upload')
+        self.assertEqual(result['diagnostic']['http_status'], 503)
+        self.assertEqual(result['transfer_attempts'], 3)
+        self.assertEqual(self.api.upload_media.call_count, 3)
+        self.api.submit_web.assert_not_called()
+        self.assertEqual(json.loads(self.journal.remote.read_text())['parts']['s-1']['diagnostic'],
+                         result['diagnostic'])
+
+    def test_rejected_media_is_not_retried_and_diagnostics_are_sanitized(self):
+        from DMR.Uploader.biliwebapi import MediaUploadError
+        error = MediaUploadError('preupload', 'server_rejected', api_code=-101)
+        error.diagnostic.update(url='https://private.invalid/?token=secret', cookie='secret')
+        self.api.upload_media.side_effect = error
+        result = self.execute()
+        self.assertEqual(result['diagnostic']['api_code'], -101)
+        self.assertEqual(self.api.upload_media.call_count, 1)
+        self.api.submit_web.assert_not_called()
+        self.assertNotIn('secret', self.journal.remote.read_text())
+
+    def test_generic_exception_retains_type_without_message(self):
+        self.uploader.metadata.side_effect = ValueError('private-cookie-secret')
+        result = self.execute()
+        self.assertEqual(result['diagnostic']['stage'], 'metadata')
+        self.assertEqual(result['diagnostic']['error_type'], 'ValueError')
+        self.assertNotIn('private-cookie-secret', self.journal.remote.read_text())
+        self.api.upload_media.assert_not_called()
+
+    def test_submit_timeout_diagnostic_does_not_enable_resubmission(self):
+        self.api.submit_web.side_effect = TimeoutError('private-url')
+        self.uploader.discover = Mock(return_value=None)
+        first = self.execute()
+        second = self.execute()
+        self.assertEqual(first['diagnostic']['stage'], 'submit')
+        self.assertEqual(first['diagnostic']['category'], 'timeout')
+        self.assertEqual(second['status'], 'unknown')
+        self.assertEqual(self.api.submit_web.call_count, 1)
+        self.assertNotIn('private-url', self.journal.remote.read_text())
+
 
 class SchedulingTests(unittest.TestCase):
     def setUp(self):
@@ -311,6 +378,59 @@ class PostingProcessTests(unittest.TestCase):
 
 
 class UpstreamTests(unittest.TestCase):
+    def test_auto_probe_skips_failed_nodes_and_selects_working_upos(self):
+        from DMR.Uploader.biliwebapi import BiliWebApi
+        from requests.exceptions import ReadTimeout
+        api = object.__new__(BiliWebApi)
+        api._session = MagicMock()
+        api.readonly_cookies = True
+        lines = [{'os': 'upos', 'query': 'upcdn=test', 'probe_url': '//test.invalid/' + str(i)}
+                 for i in range(3)]
+        api._session.get.return_value.json.return_value = {'probe': {'get': True}, 'lines': lines}
+        api._session.request.side_effect = [ReadTimeout('private'),
+            Mock(status_code=503), Mock(status_code=200)]
+        selected = api.probe()
+        self.assertEqual(selected['probe_url'], lines[2]['probe_url'])
+        self.assertEqual(api._session.request.call_count, 3)
+        self.assertNotIn('cost', lines[2])
+
+    def test_media_request_preserves_timeout_and_invalid_response_stage(self):
+        from DMR.Uploader.biliwebapi import MediaUploadError, media_request
+        from requests.exceptions import ReadTimeout
+        request = Mock(side_effect=ReadTimeout('secret'))
+        with self.assertRaises(MediaUploadError) as caught:
+            media_request(request, 'upload_init', 'unused')
+        self.assertEqual(caught.exception.diagnostic, {'stage': 'upload_init', 'category': 'timeout'})
+        request.side_effect = None
+        request.return_value = Mock(status_code=200)
+        request.return_value.json.side_effect = ValueError('secret')
+        with self.assertRaises(MediaUploadError) as caught:
+            media_request(request, 'preupload', 'unused')
+        self.assertEqual(caught.exception.diagnostic['category'], 'invalid_response')
+        self.assertNotIn('secret', str(caught.exception))
+
+    def test_chunk_http_rejection_fails_immediately_and_transient_failure_is_bounded(self):
+        from DMR.Uploader.biliwebapi import BiliWebApi, MediaUploadError
+        api = object.__new__(BiliWebApi)
+        api.readonly_cookies = True
+        session = Mock()
+        for status, calls in ((403, 1), (503, 3)):
+            with self.subTest(status=status), patch('DMR.Uploader.biliwebapi.time.sleep'):
+                session.reset_mock()
+                session.put.return_value = Mock(status_code=status)
+                with self.assertRaises(MediaUploadError) as caught:
+                    api.upload_chunk_thread(session, 'unused', b'x', {'chunk': 0}, {}, 'test', 3)
+                self.assertEqual(session.put.call_count, calls)
+                self.assertEqual(caught.exception.diagnostic['stage'], 'chunk_upload')
+                self.assertEqual(caught.exception.diagnostic['attempts'], calls)
+                self.assertEqual(caught.exception.diagnostic['http_status'], status)
+
+    def test_diagnostic_whitelist_rejects_untrusted_values(self):
+        from colab_support.diagnostics import safe_upload_diagnostic
+        self.assertEqual(safe_upload_diagnostic({'stage': ['secret'], 'http_status': True,
+                         'category': 'secret', 'error_type': 'secret'}),
+                         {'stage': 'unknown', 'error_type': 'Error'})
+
     def test_readonly_path_never_calls_login_and_desktop_default_does(self):
         from DMR.Uploader.biliwebapi import BiliWebApi
         with tempfile.TemporaryDirectory() as d:
