@@ -15,7 +15,7 @@ from colab_support.trigger import control_paths, write_ack
 from colab_support.upload_transaction import ColabBiliUploader, Journal, UploadError
 from checks.test_colab_upload import BVID, CONFIG, Remote
 
-RUN_ID = '20261011-224438-5faf4204'
+RUN_ID = '20261001-220500-bbbbbbbb'
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG = shutil.which('ffmpeg') or str(ROOT / 'tools/ffmpeg.exe')
 FFPROBE = shutil.which('ffprobe') or str(ROOT / 'tools/ffprobe.exe')

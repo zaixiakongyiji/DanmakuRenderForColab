@@ -193,7 +193,9 @@ class ColabBiliUploader:
                            key=lambda p: p['part_index'])
         if [p['part_index'] for p in confirmed] != list(range(1, index)):
             raise UploadError('upload_part_order_invalid')
-        if any(k != key and p['status'] != 'submitted' for k, p in parts.items()):
+        if any(k != key and p['status'] != 'submitted' and
+               (p['part_index'] < index or p['status'] in {'submitting', 'unknown'})
+               for k, p in parts.items()):
             raise UploadError('upload_previous_part_blocked')
         if not current:
             current = parts[key] = {'status': 'pending', 'part_index': index, 'sha256': checksum, 'size': size}

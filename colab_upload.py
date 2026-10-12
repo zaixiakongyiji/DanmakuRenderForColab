@@ -76,7 +76,7 @@ def main(argv=None):
         return upload_manifest(drive, backup, work, manifest, args.reconcile_bvid)
 
 
-def upload_manifest(drive, backup, work, manifest, reconcile_bvid=None):
+def upload_manifest(drive, backup, work, manifest, reconcile_bvid=None, *, append_session=False):
     """调用方持有 resume.lock，并已恢复及校验成品；沿用同一投稿事务。"""
     import os
     import yaml
@@ -103,6 +103,8 @@ def upload_manifest(drive, backup, work, manifest, reconcile_bvid=None):
     os.chmod(cookie, 0o600)
     segments = sorted(manifest['segments'].items(), key=lambda item: int(item[1]['segment_id']))
     journal = Journal(work / 'upload.json', backup / 'upload.json', manifest['run_id'], config['expected_uid'])
+    if journal.data.get('append_target') or (journal.data.get('append_session') and not append_session):
+        raise UploadError('resume_use_append_session')
     if set(journal.data['parts']) - set(manifest['segments']):
         raise UploadError('resume_journal_segment_unknown')
     for key, segment in segments:
