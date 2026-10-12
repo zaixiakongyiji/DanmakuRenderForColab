@@ -320,6 +320,37 @@ class SchedulingTests(unittest.TestCase):
 
 
 class PostingProcessTests(unittest.TestCase):
+    def test_resume_waits_for_terminal_result_after_progress(self):
+        from colab_upload import wait_posting_result
+        events = queue.Queue()
+        for status in ('uploading', 'uploaded', 'submitting'):
+            events.put({'source': 'uploader', 'event': 'progress', 'request_id': 's-1',
+                        'data': {'status': status}})
+        terminal = {'source': 'uploader', 'event': 'end', 'request_id': 's-1',
+                    'data': {'status': 'submitted'}}
+        events.put(terminal)
+        with patch('builtins.print'):
+            self.assertEqual(wait_posting_result(events, 's-1', 1), terminal)
+
+    def test_resume_ignores_unrelated_events_and_preserves_failure(self):
+        from colab_upload import wait_posting_result
+        events = queue.Queue()
+        events.put({'source': 'uploader', 'event': 'end', 'request_id': 's-2',
+                    'data': {'status': 'submitted'}})
+        terminal = {'source': 'uploader', 'event': 'unknown', 'request_id': 's-1',
+                    'data': {'status': 'unknown'}}
+        events.put(terminal)
+        self.assertEqual(wait_posting_result(events, 's-1', 1), terminal)
+
+    def test_progress_does_not_extend_resume_timeout(self):
+        from colab_upload import wait_posting_result
+        events = queue.Queue()
+        events.put({'source': 'uploader', 'event': 'progress', 'request_id': 's-1',
+                    'data': {'status': 'uploading'}})
+        with patch('colab_upload.time.monotonic', side_effect=[0, 0.5, 1.1]), \
+             patch('builtins.print'), self.assertRaises(queue.Empty):
+            wait_posting_result(events, 's-1', 1)
+
     def test_timeout_during_submit_is_unknown_and_process_is_killed(self):
         from colab_support.posting import PostingWorker
         with tempfile.TemporaryDirectory() as d:

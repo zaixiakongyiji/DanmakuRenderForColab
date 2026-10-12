@@ -204,7 +204,29 @@ python colab_upload.py --run-id <run_id> --reconcile-bvid <BVID>
 
 本地与 Drive 中的投稿事务记录不一致时会停止，不能覆盖本地较新的提交意图。请保留两份记录供人工核对，不通过删除 upload.json 来重试。服务器明确拒绝的稿件提交不自动再试；本版不提供自动修改或撤回已提交 P 的入口。
 
-## 7. 验证
+## 7. 按运行编号恢复处理与投稿
+
+使用 `notebooks/colab_resume.ipynb`，第一步先挂载 Drive，第二步填写原运行编号（例如 `20261011-224438-5faf4204`），再从上到下执行。先将本次恢复代码提交、推送到 `colab` 远程的 `codex/colab-poc`，再打开仓库中的 Notebook 或保存私有副本。每次准备源码使用独立目录，不覆盖录制 Notebook 的检出；本入口不使用直播触发请求，不会遇到旧请求 `trigger_expired`，也不会重新录制。
+
+开始前确认该编号的录制、补传和其他恢复实例已结束；建议另开独立 GPU 运行时。原清单必须为 failed/success，现有同编号控制回执也必须已结束。本机恢复与补传在相同 work-root 下共用进程锁；不提供 Drive 跨运行时分布式互斥，不要同时运行多个副本。
+
+表单默认补做投稿，使用现有私有 `upload.yml`（须 enabled: true）和投稿 Cookie；取消 UPLOAD 则只恢复媒体。默认 NVENC，需要 GPU；可显式选择 libx264 使用 CPU，长片处理可能较慢。媒体处理总时限默认 4 小时，投稿仍使用配置中单 P 和总收尾时限。
+
+流程校验原片、ASS、已有成品的大小和 SHA-256；成功成品复用，未完成渲染的分段从已校验原片和 ASS 重渲染。已有成功合并备份复用，否则使用当前合并逻辑处理，包括旧录像帧率与时间基准差异的规范化。合并失败仍允许补传已校验分 P，最终分别记录合并和投稿结果。已有成功备份损坏或缺失、段号不连续时停止，不用新内容覆盖证据。已存在该段投稿事务时禁止重渲染改变文件身份。
+
+新成品与合并归档放在原运行目录下的 `recovery/rendered/`、`recovery/merged/complete.mp4`，每步校验保存后更新独立 `resume_manifest.json`。重跑表单和后续步骤，会复用这些已完成结果；中断时尚未完成的媒体步骤重新执行。清单绑定原 manifest 的 SHA-256；本地与 Drive 恢复清单不同则停止核对，不自动丢弃较新证据。只校验挂载目录读回一致，不声明已验证 Drive 服务端持久性。
+
+投稿沿用原 `upload.json`、原首 P 元数据和同一稿件，核对远端后跳过 submitted，unknown/submitting 仅核对，无法确认就停止。候选 RECONCILE_BVID 通常留空，首 P 响应丢失时才填写待核对编号。恢复结果保存到 `upload_resume.json` 和 `resume_manifest.json`，不覆盖原 `manifest.json`、原录制错误或触发回执；恢复 success 仅表示现有已备份分段完成选定步骤，不能补回漏录内容。本 Notebook 保留运行时供检查，检查后手动释放。
+
+CLI 也可先检查再执行：
+
+```bash
+python colab_resume.py --run-id <run_id> --inspect-only
+python colab_resume.py --run-id <run_id>
+python colab_resume.py --run-id <run_id> --no-upload
+```
+
+## 8. 验证
 
 ```bash
 python -m unittest discover -s checks -p "test_colab*.py" -v
