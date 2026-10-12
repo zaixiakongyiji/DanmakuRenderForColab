@@ -52,6 +52,19 @@ def task_room(path):
         raise ValueError('任务配置无法读取有效直播间：请检查 download_args.url。') from None
 
 
+def validate_notebook_url(value):
+    parsed = urlparse(value or '')
+    if parsed.scheme != 'https' or parsed.netloc != 'colab.research.google.com':
+        raise ValueError('请填写 Colab Notebook 地址：支持 /drive/... 或 /github/<owner>/<repo>/blob/<branch>/...ipynb')
+    parts = parsed.path.strip('/').split('/')
+    drive = len(parts) == 2 and parts[0] == 'drive' and bool(parts[1])
+    github = (len(parts) >= 6 and parts[0] == 'github' and all(parts[1:5])
+              and parts[3] == 'blob' and parts[-1].lower().endswith('.ipynb'))
+    if not (drive or github) or parsed.query:
+        raise ValueError('请填写 Colab Notebook 地址：支持 /drive/... 或 /github/<owner>/<repo>/blob/<branch>/...ipynb')
+    return value
+
+
 def validate_settings(value):
     if not isinstance(value, dict) or value.get('schema_version') != 1:
         raise ValueError('本地启动设置无效，请用 --setup 重新配置；不会删除监控状态。')
@@ -68,10 +81,7 @@ def validate_settings(value):
         (drive / 'DMRColab').mkdir(parents=True, exist_ok=True)
     except OSError:
         raise ValueError('无法在 Drive 同步目录创建 DMRColab，请检查路径和权限。') from None
-    notebook = urlparse(value['notebook_url'])
-    if (notebook.scheme != 'https' or notebook.netloc != 'colab.research.google.com'
-            or not notebook.path.startswith('/drive/') or not notebook.path[7:].strip('/')):
-        raise ValueError('请填写已保存私有副本的 Colab 地址：https://colab.research.google.com/drive/...')
+    validate_notebook_url(value['notebook_url'])
     validate_cdp(value['cdp_url'])
     if not Path(value['browser']).is_file():
         raise ValueError('Chrome/Edge 程序路径不存在，请用 --setup 重新配置。')
@@ -94,7 +104,7 @@ def find_browser():
 
 def setup(old=None):
     old = old or {}
-    print('首次设置：选择本地任务、Drive 同步目录和私有 Notebook。不会读取或保存 Cookie。')
+    print('首次设置：选择本地任务、Drive 同步目录和 Colab Notebook。支持私有 Drive 副本或 GitHub 地址；不会读取或保存 Cookie。')
     tasks = sorted((ROOT / 'configs').glob('DMR-*.yml'))
     for index, task in enumerate(tasks, 1):
         print(f'  {index}. {task.name}')
@@ -112,7 +122,7 @@ def setup(old=None):
         'schema_version': 1,
         'task_config': str(task.resolve()),
         'drive_sync_root': prompt('My Drive 同步根目录（例如 G:\你的云端硬盘）', old.get('drive_sync_root', '')),
-        'notebook_url': prompt('私有 Colab Notebook 地址', old.get('notebook_url', '')),
+        'notebook_url': prompt('Colab Notebook 地址（Drive 副本或 GitHub）', old.get('notebook_url', '')),
         'browser': prompt('Chrome/Edge 程序路径', old.get('browser', find_browser())),
         'cdp_url': prompt('专用浏览器 CDP 地址', old.get('cdp_url', 'http://127.0.0.1:9222')),
         'google_account': prompt('Google 账号邮箱（留空仅自动选择唯一账号）', old.get('google_account', '')),

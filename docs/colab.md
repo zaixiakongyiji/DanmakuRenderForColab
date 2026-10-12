@@ -138,7 +138,7 @@ Windows 可双击仓库根目录的 `start_colab_monitor.cmd`。首次运行：
 .\start_colab_monitor.cmd --setup
 ```
 
-向导选择任务配置（例如 `configs/DMR-example.yml`），填写本机 Google Drive for desktop 的同步根目录，例如 `G:\你的云端硬盘`，以及私有 Colab Notebook 地址。可选填写 Google 账号邮箱，用于多账号选择；留空仅自动选择唯一可识别账号。旧启动设置仍可使用，需要指定账号时重新运行 `--setup`。向导会自动创建 `DMRColab/control`，设置保存在 `.temp/colab-monitor-settings.json`，不会保存 Cookie。后续直接双击 `.cmd` 即可复用设置。
+向导选择任务配置（例如 `configs/DMR-example.yml`），填写本机 Google Drive for desktop 的同步根目录，例如 `G:\你的云端硬盘`，以及 Colab Notebook 地址。Notebook 支持私有 Drive 副本 `https://colab.research.google.com/drive/...`，也支持 GitHub 地址 `https://colab.research.google.com/github/<owner>/<repo>/blob/<branch>/...ipynb`；GitHub 模式下 Notebook 仍挂载同一个 Drive，并从 `DMRColab/control` 读取本地触发请求。可选填写 Google 账号邮箱，用于多账号选择；留空仅自动选择唯一可识别账号。旧启动设置仍可使用，需要指定账号时重新运行 `--setup`。向导会自动创建 `DMRColab/control`，设置保存在 `.temp/colab-monitor-settings.json`，不会保存 Cookie。后续直接双击 `.cmd` 即可复用设置。
 
 `--drive-sync-root` 必须是本机可读写的同步目录。触发器把 `request.json`、`claim.json` 和 `ack.json` 写入该目录，Google Drive 将它们同步给 Notebook；录像、渲染和合并仍在 Colab 运行时处理，并备份到 Drive 的 `DMRColab/runs/<run_id>/`。
 
@@ -148,7 +148,7 @@ Windows 可双击仓库根目录的 `start_colab_monitor.cmd`。首次运行：
 python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive"
 ```
 
-自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。首次登录、授权和保存表单可使用 CPU。正式副本保存为 GPU 类型，选择“读取本地触发请求”，准备完成后断开运行时；监控期间无需 GPU 连接，Run all 在开播后申请运行时。实际 GPU 型号由预检记录：
+自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。首次登录、授权和保存表单可使用 CPU。录制 Notebook 默认选择“读取本地触发请求”，正式副本保存为 GPU 类型，准备完成后断开运行时；需要手动录制时再切换为“手动填写直播间”。监控期间无需 GPU 连接，Run all 在开播后申请运行时。实际 GPU 型号由预检记录：
 
 ```powershell
 python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive" --notebook-url "<自己的 Notebook URL>" --auto-run --cdp-url http://127.0.0.1:9222

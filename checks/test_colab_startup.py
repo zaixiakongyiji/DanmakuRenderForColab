@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from colab_support.drive_authorization import DriveAuthorization, DriveAuthorizationWatcher
 from colab_support.notebook_session import PreparationHeartbeat, prepare_session
+from colab_monitor import validate_notebook_url
 from colab_support.trigger import (ColabLauncher, TriggerMonitor, TriggerResult,
                                    control_paths, write_ack)
 
@@ -273,6 +274,20 @@ class AuthorizationTests(unittest.TestCase):
 
 
 class NotebookStartupTests(unittest.TestCase):
+    def test_notebook_url_accepts_drive_and_github_forms(self):
+        for url in (
+            'https://colab.research.google.com/drive/notebook-id#scrollTo=cell',
+            'https://colab.research.google.com/github/example/project/blob/main/notebooks/colab_record.ipynb',
+        ):
+            self.assertEqual(validate_notebook_url(url), url)
+        for url in (
+            'https://colab.research.google.com/github/example/project/blob/main/notebooks/record.py',
+            'https://colab.research.google.com/github/example/project/tree/main/notebooks/record.ipynb',
+            'https://evil.example/github/example/project/blob/main/record.ipynb',
+        ):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                validate_notebook_url(url)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -370,6 +385,7 @@ class NotebookStartupTests(unittest.TestCase):
     def test_notebook_mounts_and_claims_before_installation(self):
         nb = json.loads((Path(__file__).resolve().parents[1] / 'notebooks/colab_record.ipynb').read_text(encoding='utf-8'))
         cells = {cell['id']: ''.join(cell['source']) for cell in nb['cells']}
+        self.assertIn('START_MODE = "读取本地触发请求"', cells['colab-parameters'])
         namespace = {'SETUP_PHASE': 'form', 'RUN_PARAMETERS': {'room_url': ''}}
         drive = SimpleNamespace(mount=Mock())
         with patch.dict(sys.modules, {'google.colab': SimpleNamespace(drive=drive)}):
