@@ -34,7 +34,7 @@ class RawFFmpegRender(BaseRender):
             if not self.debug and self.render_proc.stdin is not None:
                 self.render_proc.stdin.close()
             if self.debug:
-                return True, ''
+                return self.render_proc.returncode == 0, f'FFmpeg exit code: {self.render_proc.returncode}'
 
             info = None
             log = ''

@@ -637,7 +637,7 @@ class TriggerMonitor:
                     self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_pending'
                     if (now - updated).total_seconds() >= 60:
                         self.state.last_error = 'runtime_release_unknown'
-                elif self.launcher.runtime_connection_state() is not False:
+                elif self.launcher.runtime_connection_state(notebook_url=self.state.notebook_url) is not False:
                     self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_unconfirmed'
             if ack['status'] not in {'success', 'failed'} and (now - updated).total_seconds() > 300:
                 self.state.status, self.state.last_error = 'needs_attention', 'runtime_heartbeat_stale'

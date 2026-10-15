@@ -237,6 +237,11 @@ class ColabBiliUploader:
             journal.save()
         current['stage'] = 'identity'
         self.check_identity()
+        # 媒体传输可能耗时很长，提交前重新核对，保留期间的外部修改。
+        if journal.data['bvid']:
+            remote = self.remote(journal.data['bvid'])
+            if [v['filename'] for v in remote.videos] != [p['filename'] for p in confirmed]:
+                raise UploadError('upload_remote_parts_mismatch')
         new_part = {'filename': current['filename'],
                     'title': part_title if part_title is not None else 'P' + str(index), 'desc': ''}
         if remote:

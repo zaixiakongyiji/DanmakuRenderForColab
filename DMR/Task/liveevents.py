@@ -211,6 +211,8 @@ class LiveEvents(BaseEvents):
                             if arg.get('realtime'):
                                 continue
                             up_videos = [video for video in videos if video.duration >= arg.get('min_length', 0)]
+                            if not up_videos:
+                                continue
                             upload_group_id = up_videos[0].upload_group_id if hasattr(up_videos[0], 'upload_group_id') else group_id
                             upload_msg = PipeMessage(
                                 source=self.name,
@@ -260,6 +262,16 @@ class LiveEvents(BaseEvents):
         clean_args = self.config['clean_args']
         for group_id, video_states in self.state_dict.items():
             for idx, video_state in enumerate(video_states):
+                # 原片、ASS 和成品存在共享依赖；其他渲染或上传未结束时保留整段。
+                if any(info['wait'] or info['status'] in {'rendering', 'uploading'}
+                       for info in video_state.values()):
+                    continue
+                if any(info['status'] == 'ready' and any(
+                        vtype in types.split('+') and any(
+                            info['file'].duration >= arg.get('min_length', 0) for arg in args)
+                        for types, args in self.config.get('upload_args', {}).items())
+                       for vtype, info in video_state.items()):
+                    continue
                 for vtype, info in video_state.items():
                     if info['status'] != 'uploaded':
                         continue

@@ -1,4 +1,5 @@
 import argparse
+import math
 from datetime import datetime
 from glob import glob
 import os
@@ -70,7 +71,11 @@ def main():
         os.makedirs(output_dir,exist_ok=True)
         output = join(output_dir,filename)
 
-        if exists(output) and FFprobe.get_duration(output) - FFprobe.get_duration(vname) < 30:
+        output_duration = FFprobe.get_duration(output) if exists(output) else -1
+        source_duration = FFprobe.get_duration(vname) if exists(output) else -1
+        if (math.isfinite(output_duration) and math.isfinite(source_duration)
+                and output_duration > 0 and source_duration > 0
+                and abs(output_duration - source_duration) < 30):
             ignores.append({
                 'video': vname,
                 'msg': f'视频 {vname} 已经存在带弹幕视频 {output}，跳过渲染.',
