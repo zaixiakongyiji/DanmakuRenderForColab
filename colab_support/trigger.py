@@ -313,6 +313,32 @@ class ColabLauncher:
         except Exception:
             return False
 
+    def restore_notebook(self, notebook_url):
+        """显示现有任务的原页面，只导航，绝不重放全部运行。"""
+        if not self.auto_run or not self.cdp_url:
+            return False
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp(self.cdp_url, timeout=10000)
+                pages = [p for context in browser.contexts for p in context.pages]
+                base = notebook_url.split('#', 1)[0]
+                page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
+                if page is None:
+                    if not browser.contexts:
+                        return False
+                    # 新启动的专用浏览器通常只有空白标签，直接复用。
+                    page = next((p for p in pages if p.url == 'about:blank'), None)
+                    if page is None:
+                        page = browser.contexts[0].new_page()
+                    page.goto(notebook_url, wait_until='domcontentloaded', timeout=30000)
+                page.get_by_role('button', name=RUN_ALL_BUTTON).first.wait_for(
+                    state='visible', timeout=30000)
+                page.bring_to_front()
+                return page.url.split('#', 1)[0] == base
+        except Exception:
+            return False
+
     @staticmethod
     def _click_authorize_drive(page) -> bool:
         try:
@@ -364,20 +390,35 @@ class ColabLauncher:
         button.click(timeout=5000)
         return True
 
-    def runtime_connection_state(self, notebook_url=None):
+    def runtime_connection_state(self, notebook_url=None, *, reopen_missing=False):
         """返回 True=明确连接、False=明确未连接、None=无法判断。"""
         if not self.auto_run or not self.cdp_url:
             return None
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as pw:
-                browser = pw.chromium.connect_over_cdp(self.cdp_url)
+                browser = pw.chromium.connect_over_cdp(self.cdp_url, timeout=10000)
                 pages = [p for context in browser.contexts for p in context.pages]
-                base = (notebook_url or self.notebook_url).split('#', 1)[0]
-                page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
-                if page is None:
-                    return None
-                return self._connection_state(page)
+                target = notebook_url or self.notebook_url
+                base = target.split('#', 1)[0]
+                matches = [p for p in pages if p.url.split('#', 1)[0] == base]
+                if not matches:
+                    if not reopen_missing or not browser.contexts:
+                        return None
+                    # 关闭标签不代表运行时已释放；恢复时重开原地址，仅检查状态。
+                    page = browser.contexts[0].new_page()
+                    page.goto(target, wait_until='domcontentloaded', timeout=30000)
+                    matches = [page]
+                deadline = time.monotonic() + 15
+                while True:
+                    states = [self._connection_state(page) for page in matches]
+                    if any(state is True for state in states):
+                        return True
+                    if all(state is False for state in states):
+                        return False
+                    if time.monotonic() >= deadline:
+                        return None
+                    matches[0].wait_for_timeout(250)
         except Exception:
             return None
 
@@ -423,6 +464,33 @@ class TriggerMonitor:
         self.state = TriggerState.load(self.state_file, self.room_url)
         self.state.save(self.state_file)
 
+    def resume_pending(self):
+        """监控重启时显示待认领或仍活动的原任务，不发请求或重复点击。"""
+        state = self.state
+        if (not self.launcher.auto_run or not state.triggered or not state.run_id
+                or state.status not in {'opened', 'accepted', 'running', 'draining', 'needs_attention'}
+                or state.last_error in {'active_run_conflict', 'trigger_state_invalid', 'launch_state_unknown'}):
+            return
+        stamp = datetime.fromtimestamp(self.now(), timezone.utc)
+        self._read_ack(stamp)
+        # 认领期限只约束尚未启动的请求；活动任务即使超过该期限也需显示页面。
+        if state.ack_status in {'accepted', 'running', 'draining'}:
+            restored = self.launcher.restore_notebook(state.notebook_url or self.launcher.notebook_url)
+            state.save(self.state_file)
+            return restored
+        if state.ack_status is not None or state.last_error not in {None, 'pending_notebook_unavailable'}:
+            return
+        age = (stamp - datetime.fromisoformat(state.triggered_at)).total_seconds()
+        if not 0 <= age < TRIGGER_CLAIM_SECONDS:
+            return
+        restored = self.launcher.restore_notebook(state.notebook_url or self.launcher.notebook_url)
+        if restored:
+            state.status, state.last_error = 'opened', None
+        else:
+            state.status, state.last_error = 'needs_attention', 'pending_notebook_unavailable'
+        state.save(self.state_file)
+        return restored
+
     def recover_expired(self):
         """显式恢复未认领的过期请求；调用方须持有监控状态进程锁。"""
         state = self.state
@@ -454,10 +522,12 @@ class TriggerMonitor:
                 raise ValueError('恢复失败：旧请求已有认领或回执，不能按未启动任务重置。')
 
         require_unclaimed()
-        connected = (self.launcher.runtime_connection_state(notebook_url=state.notebook_url)
-                     if state.notebook_url else self.launcher.runtime_connection_state())
+        connected = self.launcher.runtime_connection_state(
+            notebook_url=state.notebook_url, reopen_missing=True)
+        if connected is True:
+            raise ValueError('恢复失败：旧 Notebook 仍连接，请先检查旧任务并断开运行时，再执行 --recover-expired。')
         if connected is not False:
-            raise ValueError('恢复失败：旧 Notebook 仍连接或无法确认状态，请先检查旧任务和运行时。')
+            raise ValueError('恢复失败：无法确认旧 Notebook 状态，请在专用浏览器检查原页面的登录、弹窗和连接状态，再执行 --recover-expired。')
         self.launcher.close()
         if self.launcher.authorization is not None:
             raise ValueError('恢复失败：旧授权监听尚未退出。')

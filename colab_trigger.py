@@ -22,6 +22,7 @@ FRIENDLY_ERRORS = {
     "runtime_release_pending": "等待 Colab 释放运行时",
     "runtime_release_unknown": "Colab 运行时释放状态未知",
     "launch_state_unknown": "Colab 启动状态未知",
+    "pending_notebook_unavailable": "待认领请求的原 Notebook 页面恢复失败；请检查专用浏览器，未重复点击全部运行",
     "ack_invalid": "回执文件无效或损坏",
     "probe_unavailable": "网络探测不可用",
     "trigger_state_invalid": "触发器状态文件损坏",
@@ -77,8 +78,10 @@ def format_trigger_message(target_name: str, result: TriggerResult) -> tuple[int
         return logging.INFO, f"[{target_name}] 直播未开播，正在监听中..."
     if state == "live":
         return logging.INFO, f"[{target_name}] 检测到开播信号，正在确认状态..."
-    if state in ("dispatching", "opened"):
+    if state == "dispatching":
         return logging.INFO, f"[{target_name}] 正在打开 Colab Notebook 并发出录制请求{run_info}"
+    if state == "opened":
+        return logging.INFO, f"[{target_name}] 已有 Colab 请求，等待认领；本轮未重复点击全部运行{run_info}"
     if state == "accepted":
         return logging.INFO, f"[{target_name}] Colab 已认领录制任务{run_info}"
     if state == "running":
@@ -144,6 +147,12 @@ def monitor_loop(args, room_url, launcher):
             print(json.dumps({'status': 'recovered', 'archive': str(archive)}, ensure_ascii=False), flush=True)
         else:
             logger.info('已归档未认领的过期请求状态：%s；重新确认开播状态。', archive)
+    if monitor.resume_pending() is False:
+        if args.json:
+            print(json.dumps({'event': 'notebook_page_restore_failed',
+                              'run_id': monitor.state.run_id}, ensure_ascii=False), flush=True)
+        else:
+            logger.warning('原 Notebook 页面未能显示，请检查专用浏览器；任务状态继续按 Drive 回执读取。')
     target_name, room_id = resolve_target_info(room_url)
 
     if not args.json:

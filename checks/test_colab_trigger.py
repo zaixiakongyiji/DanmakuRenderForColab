@@ -270,6 +270,11 @@ class TriggerTests(unittest.TestCase):
         self.assertIn('已发送 Colab 运行请求，等待认领', msg)
         self.assertIn('run-123', msg)
 
+        level, msg = format_trigger_message(target, TriggerResult('opened', run_id='run-123'))
+        self.assertIn('等待认领', msg)
+        self.assertIn('未重复点击', msg)
+        self.assertNotIn('正在打开', msg)
+
         level, msg = format_trigger_message(target, TriggerResult('running', run_id='run-123'))
         self.assertEqual(level, logging.INFO)
         self.assertIn('Colab 正常运行中', msg)

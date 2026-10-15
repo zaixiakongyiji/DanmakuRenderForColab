@@ -52,6 +52,36 @@ def prepare_cookie(source, private_dir):
     return destination
 
 
+def check_watch_login(cookie_file):
+    """只读确认观看登录；不刷新凭据，也不允许请求携带 Cookie 跳转。"""
+    import requests
+
+    payload = json.loads(Path(cookie_file).read_text(encoding='utf-8'))
+    cookies = {item['name']: item['value'] for item in payload['cookie_info']['cookies']}
+    unavailable = '无法确认观看 Cookie 登录状态，请检查网络或 B 站接口后重试；已停止预检。'
+    try:
+        with requests.get(
+            'https://api.bilibili.com/x/web-interface/nav', cookies=cookies,
+            headers={'Referer': 'https://www.bilibili.com/', 'User-Agent': 'Mozilla/5.0'},
+            timeout=15, allow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                raise ValueError()
+            result = response.json()
+    except (requests.RequestException, ValueError):
+        # 网络异常和响应可能含账号数据，不能原样写入日志。
+        raise RuntimeError(unavailable) from None
+    if not isinstance(result, dict):
+        raise RuntimeError(unavailable)
+    data = result.get('data')
+    if result.get('code') == -101 or (
+        result.get('code') == 0 and isinstance(data, dict) and data.get('isLogin') is False
+    ):
+        raise ValueError('观看 Cookie 登录已失效，请更新私有 Drive 中的观看凭据后重试；已停止预检。')
+    if result.get('code') != 0 or not isinstance(data, dict) or data.get('isLogin') is not True:
+        raise RuntimeError(unavailable)
+
+
 def prepare_upload(args):
     from .upload_config import load_upload_config, load_upload_cookie
     config = load_upload_config(args.upload_config)
@@ -77,7 +107,8 @@ def preflight(args):
             raise RuntimeError('缺少工具：' + name)
     if not args.drive_root.is_dir():
         raise RuntimeError('Drive 目录不存在，请先运行 drive.mount 并确认 MyDrive。')
-    prepare_cookie(args.cookie, args.run_dir / 'private')
+    cookie = prepare_cookie(args.cookie, args.run_dir / 'private')
+    check_watch_login(cookie)
     from .uploader import prepare_identity
     upload = prepare_upload(args)
     prepare_identity(args.upload_cookie, upload)

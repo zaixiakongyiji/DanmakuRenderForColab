@@ -43,7 +43,7 @@ Notebook 默认从 fork 的 codex/colab-poc 拉取，清单记录实际 commit S
 MyDrive/DMRColab/credentials/bilibili.json
 ```
 
-必须包含 cookie_info.cookies 列表和非空 SESSDATA。只复制 Cookie 到临时盘 private 目录，不复制 refresh token，不运行 biliup 登录或续期。文件缺失或错误时停止预检。观看凭据失效或实际画质下降需用户更新凭据；清单保留实际 quality 和 stream_type。
+必须包含 cookie_info.cookies 列表和非空 SESSDATA。只复制 Cookie 到临时盘 private 目录，不复制 refresh token，不运行 biliup 登录或续期。文件缺失或错误时停止预检。每次预检及正式运行启动时，使用观看凭据调用 B 站官方 nav 接口，只读核验登录状态；登录失效时停止并提示更新观看凭据，网络或接口异常导致无法确认时也停止并提示重试，不静默降级为未登录录制。此检查不自动刷新或替换凭据，也不保证直播源提供原画；清单保留实际 quality 和 stream_type。
 
 ## 2. Notebook 与环境
 
@@ -162,7 +162,9 @@ python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync
 
 `--once --auto-run` 会等待认领后退出，期间授权监听保持活动；认领失败或超时返回非零退出码。仅打开浏览器的 `--once` 保持触发后退出。
 
-`--setup` 只修改设置，保留活动或未确认的请求状态。旧请求认领超时后，先停止监控并核实旧 Notebook 没有活动任务，再执行 `start_colab_monitor.cmd --recover-expired`，无需手动改名状态文件。恢复入口在进程锁内校验原请求已过期、Drive 没有 claim/ack 文件且原 Notebook 明确未连接；通过后归档本地状态到 `.temp/colab-trigger-state.expired-<run_id>.bak.json`，重新累计开播确认次数。请求文件、过期时间和历史结果保持原值。有认领、回执、未知运行时状态或损坏请求时拒绝恢复。新请求记录原 Notebook 地址，修改启动设置后仍检查原地址；旧版状态不含该地址，执行恢复前须由本人核实旧副本，再检查当前配置的 Notebook。
+监控重启时，尚未过期且未收到回执的已发送请求会保留原运行编号，并补开原 Notebook 页面（优先复用专用浏览器的空白标签）。已认领、运行中和收尾中的任务同样会恢复原页面，不受认领期限限制；页面渲染完成后切换到该标签。此时不会重写请求、延长有效期或再次点击全部运行；未认领时日志显示“已有 Colab 请求，等待认领”。补开页面失败会独立告警，活动任务状态仍按 Drive 回执读取。页面恢复不代表录制已启动，只有认领回执才能确认 Colab 已接收任务；过期且未认领的请求仍走下述显式恢复流程。
+
+`--setup` 只修改设置，保留活动或未确认的请求状态。旧请求认领超时后，先停止监控并核实旧 Notebook 没有活动任务，再执行 `start_colab_monitor.cmd --recover-expired`，无需手动改名状态文件。恢复入口在进程锁内校验原请求已过期、Drive 没有 claim/ack 文件且原 Notebook 明确未连接；通过后归档本地状态到 `.temp/colab-trigger-state.expired-<run_id>.bak.json`，重新累计开播确认次数。原 Notebook 标签已关闭时，恢复入口会在专用浏览器重新打开原地址，等待最多 15 秒识别连接状态，不点击全部运行或连接按钮；同地址有多个标签时，任一仍连接或状态未知都会阻止恢复。请求文件、过期时间和历史结果保持原值。有认领、回执、未知运行时状态或损坏请求时拒绝恢复；错误信息分别提示仍连接和无法确认，后者需检查登录或弹窗。新请求记录原 Notebook 地址，修改启动设置后仍检查原地址；旧版状态不含该地址，执行恢复前须由本人核实旧副本，再检查当前配置的 Notebook。
 
 自动模式在⑦完成结果汇总和媒体校验后保存最终清单与回执，随后调用 `google.colab.runtime.unassign()`；⑧仅供手动模式检查。失败任务先补存尚未备份的已关闭媒体到 `recovery/`，不复制 Cookie、私有配置和原始 console 日志。保存无法完成或监督器仍活动时不释放，保留唯一副本并报告 `needs_attention`。认领前的授权、源码下载等错误无法保证自动释放，15 分钟认领超时后人工检查。
 
