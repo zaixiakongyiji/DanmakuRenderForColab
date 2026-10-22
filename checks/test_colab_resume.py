@@ -365,6 +365,8 @@ class RecoveryNotebookTests(unittest.TestCase):
             exec(''.join(cells[1]['source']), auto_context)
             self.assertEqual(auto_context['RESUME_PHASE'], 'form')
             self.assertEqual(auto_context['RESUME_PARAMETERS']['run_id'], RUN_ID)
+            self.assertIs(auto_context['RESUME_PARAMETERS']['auto_release'], True)
+            self.assertIn('runtime.unassign()', ''.join(cells[4]['source']))
 
 
 if __name__ == '__main__':
