@@ -360,6 +360,11 @@ class RecoveryNotebookTests(unittest.TestCase):
             self.assertEqual(context['RESUME_PHASE'], 'form')
             self.assertIsNone(context['RESUME_COMMAND'])
             self.assertEqual(context['RESUME_PARAMETERS']['run_id'], RUN_ID)
+            manifest.write_text('{"status": "failed"}', encoding='utf-8')
+            auto_context = {'RESUME_PHASE': 'drive', 'DRIVE_ROOT': drive}
+            exec(''.join(cells[1]['source']), auto_context)
+            self.assertEqual(auto_context['RESUME_PHASE'], 'form')
+            self.assertEqual(auto_context['RESUME_PARAMETERS']['run_id'], RUN_ID)
 
 
 if __name__ == '__main__':

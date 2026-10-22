@@ -41,8 +41,10 @@
 | [`colab_monitor.py`](colab_monitor.py) | 本地 Windows / CLI | 本地监控核心逻辑，管理专用浏览器 Profile 与轮询开播状态 |
 | [`colab_trigger.py`](colab_trigger.py) | 本地 CLI | 底层触发脚本，负责向 Drive 写入任务控制信号并通过 CDP 操作 Notebook |
 | [`notebooks/colab_record.ipynb`](notebooks/colab_record.ipynb) | Google Colab | 云端运行的 Jupyter Notebook 宿主，组织环境准备、预检与任务执行 |
+| [`notebooks/colab_resume.ipynb`](notebooks/colab_resume.ipynb) | Google Colab | 云端补渲染、合并归档与投稿恢复 Notebook（`RUN_ID` 留空可自动匹配最近失败任务） |
 | [`colab_run.py`](colab_run.py) | Colab 容器内 | 云端核心协调器，调度 DMR 下载器、渲染队列、备份流水线与投稿事务 |
-| [`colab_upload.py`](colab_upload.py) | Colab 容器内 | 独立补传工具，用于为已关闭但未完成投稿的历史任务继续追传分 P |
+| [`colab_resume.py`](colab_resume.py) | Colab 容器内 | 按 `run_id` 从已备份原片和 ASS 补渲染缺失分段、补做合并归档并继续投稿 |
+| [`colab_upload.py`](colab_upload.py) | Colab 容器内 | 独立补传工具，用于为已完成渲染的历史任务继续追传分 P |
 
 ---
 
@@ -124,16 +126,23 @@ Google Drive (我的云端硬盘)
 
 ---
 
-## 异常恢复与按运行编号补传
+## 异常恢复：补渲染、合并与按运行编号补传
 
-若某次运行中遇到网络抖动或 B 站 API 异常导致部分分 P 未成功追加，但视频和 ASS 已安全备份在 Drive 中：
+若某次运行因渲染异常、合并未完成或 B 站 API 抖动中断，但原片（`source/`）和弹幕（`danmaku/`）已安全备份在 Drive 中：
 
-在挂载好 Drive 的 Colab 环境中执行：
-```bash
-python colab_upload.py --run-id <run_id> --drive-root /content/drive/MyDrive
-```
+1. **使用恢复 Notebook 一键补渲染并上传（推荐）**：
+   - 在 Colab 中打开 [`notebooks/colab_resume.ipynb`](notebooks/colab_resume.ipynb)（选择 GPU 运行时）。
+   - `RUN_ID` 可填写目标运行编号（虚构示例：`20261001-220500-bbbbbbbb`），也可**直接留空**自动选择 Drive 中最近一次失败任务。
+   - 依次运行各单元格（或点击“全部运行”），即可自动校验原片与 ASS、使用 NVENC 补渲染缺失成品、生成合并归档并完成 B 站投稿。
+2. **命令行方式**：
+   ```bash
+   # 包含缺失成品补渲染 + 合并归档 + 投稿
+   python colab_resume.py --run-id <run_id> --drive-root /content/drive/MyDrive
+   # 仅补传已完成渲染的分 P
+   python colab_upload.py --run-id <run_id> --drive-root /content/drive/MyDrive
+   ```
 
-- 补传程序会自动校验原片、ASS 和成品三个备份的 SHA-256，核对已有稿件的远端分 P 序列，并自动跳过已提交的段，安全继续追传剩余分 P。
+- 恢复与补传程序会自动校验原片、ASS 和成品的 SHA-256，核对已有稿件的远端分 P 序列，并自动跳过已提交的段。
 - 详细机制与状态核对见 [Colab 详细规范文档](docs/colab.md)。
 
 ---

@@ -42,6 +42,32 @@ def media_command(command, deadline, *, capture=False, cwd=None):
         return result.stdout
 
 
+def _parse_frame_rate(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        rate = Fraction(value)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if rate > 0 else None
+
+
+def _effective_video_frame_rate(video):
+    # 直播流直拷封装常因时间戳微抖动使 r_frame_rate 飙升（如 250/1），此时回退至 avg_frame_rate 并吸附常用帧率。
+    r_rate = _parse_frame_rate(video.get('r_frame_rate'))
+    avg_rate = _parse_frame_rate(video.get('avg_frame_rate'))
+    if r_rate is not None and 1 <= r_rate <= 120:
+        if avg_rate is None or not (1 <= avg_rate <= 120) or abs(r_rate - avg_rate) / avg_rate <= Fraction(1, 5):
+            return r_rate
+    if avg_rate is not None and 1 <= avg_rate <= 120:
+        common = (15, 24, 25, 30, 48, 50, 60, 90, 120)
+        nearest = min(common, key=lambda target: abs(avg_rate - target))
+        snapped = Fraction(nearest, 1) if abs(avg_rate - nearest) <= Fraction(3, 10) else avg_rate.limit_denominator(1001)
+        if 1 <= snapped <= 120:
+            return snapped
+    raise ValueError('invalid_frame_rate')
+
+
 def probe(path, ffprobe, deadline):
     raw = media_command([ffprobe, '-v', 'error', '-show_format', '-show_streams',
                          '-show_data_hash', 'sha256', '-of', 'json', str(path)],
@@ -59,7 +85,17 @@ def probe(path, ffprobe, deadline):
         fields = ('codec_type', 'codec_name', 'codec_tag_string', 'profile', 'level',
                   'width', 'height', 'pix_fmt', 'sample_aspect_ratio', 'time_base',
                   'sample_rate', 'channels', 'channel_layout', 'extradata_hash', 'r_frame_rate')
-        signature = [{key: s.get(key) for key in fields} for s in streams]
+        signature = []
+        for s in streams:
+            item = {key: s.get(key) for key in fields}
+            if s.get('codec_type') == 'video':
+                try:
+                    effective = _effective_video_frame_rate(s)
+                    if _parse_frame_rate(s.get('r_frame_rate')) != effective:
+                        item['r_frame_rate'] = f'{effective.numerator}/{effective.denominator}'
+                except ValueError:
+                    pass
+            signature.append(item)
         if any(not s.get('codec_name') or not s.get('time_base') for s in streams):
             raise ValueError()
     except (ValueError, KeyError, TypeError):
@@ -70,9 +106,7 @@ def probe(path, ffprobe, deadline):
 def video_frame_rate(signature):
     try:
         video = next(s for s in signature if s.get('codec_type') == 'video')
-        rate = Fraction(video['r_frame_rate'])
-        if not 1 <= rate <= 120:
-            raise ValueError()
+        rate = _effective_video_frame_rate(video)
         return str(rate)
     except (StopIteration, KeyError, TypeError, ValueError, ZeroDivisionError):
         raise MergeError('merge_invalid_frame_rate') from None

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from colab_support.core import digest
-from colab_support.merge import MergeError, merge_rendered, probe, video_encoding_args, media_command
+from colab_support.merge import MergeError, merge_rendered, probe, video_encoding_args, video_frame_rate, media_command
 
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG = shutil.which('ffmpeg') or str(ROOT / 'tools/ffmpeg.exe')
@@ -103,6 +103,36 @@ class MediaCompatibilityTests(unittest.TestCase):
                 self.merge()
         self.assertEqual(digest(first), checksum)
         self.assertFalse(list((self.root / 'merged').glob('normalized-*')))
+
+    def test_inflated_r_frame_rate_falls_back_to_avg_frame_rate(self):
+        raw_probe = b'''{
+            "format": {"duration": "3498.262000"},
+            "streams": [
+                {
+                    "codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1",
+                    "profile": "Main", "level": 40, "width": 1080, "height": 1920,
+                    "pix_fmt": "yuv420p", "time_base": "1/16000",
+                    "extradata_hash": "SHA256:abc",
+                    "r_frame_rate": "250/1", "avg_frame_rate": "3641125/145761"
+                },
+                {
+                    "codec_type": "audio", "codec_name": "aac", "codec_tag_string": "mp4a",
+                    "profile": "LC", "time_base": "1/48000", "sample_rate": "48000",
+                    "channels": 2, "channel_layout": "stereo",
+                    "extradata_hash": "SHA256:def",
+                    "r_frame_rate": "0/0", "avg_frame_rate": "0/0"
+                }
+            ]
+        }'''
+        with patch('colab_support.merge.media_command', return_value=raw_probe):
+            duration, signature = probe('dummy.mp4', 'ffprobe', time.monotonic() + 10)
+        self.assertAlmostEqual(duration, 3498.262)
+        self.assertEqual(signature[0]['r_frame_rate'], '25/1')
+        self.assertEqual(video_frame_rate(signature), '25')
+        self.assertEqual(video_frame_rate([{
+            'codec_type': 'video', 'r_frame_rate': '120/1', 'avg_frame_rate': '25/1'}]), '25')
+        with self.assertRaisesRegex(MergeError, 'merge_invalid_frame_rate'):
+            video_frame_rate([{'codec_type': 'video', 'r_frame_rate': '250/1', 'avg_frame_rate': '0/0'}])
 
 
 if __name__ == '__main__':
