@@ -358,6 +358,128 @@ class TriggerTests(unittest.TestCase):
         # verbose 模式下每轮都输出，共 3 次 log
         self.assertEqual(mock_logger_verbose.log.call_count, 3)
 
+    def test_auto_run_restarts_closed_browser_reuses_blank_and_retries_click(self):
+        import sys
+        import colab_monitor
+        from colab_trigger import parser as trigger_parser
+
+        value = {
+            'task_config': 'test.yml', 'drive_sync_root': str(self.root),
+            'notebook_url': 'https://colab.test/notebook', 'cdp_url': 'http://127.0.0.1:9222',
+            'browser': 'C:/Chrome/chrome.exe',
+        }
+        with patch.object(colab_monitor, 'task_room', return_value='https://live.bilibili.com/1'):
+            cmd = colab_monitor.trigger_command(value)
+        self.assertIn('--browser', cmd)
+        self.assertIn('C:/Chrome/chrome.exe', cmd)
+        parsed = trigger_parser().parse_args(cmd[3:])
+        self.assertEqual(parsed.browser, 'C:/Chrome/chrome.exe')
+
+        launcher = ColabLauncher(
+            'https://colab.test/github/owner/repo/blob/codex%2Fcolab-poc/notebooks/colab_record.ipynb',
+            self.root, auto_run=True, cdp_url='http://127.0.0.1:9222',
+            browser_executable='C:/Chrome/chrome.exe',
+        )
+        blank = MagicMock(url='about:blank')
+        context = MagicMock(pages=[blank])
+        browser = MagicMock(contexts=[context])
+        manager = MagicMock()
+        manager.__enter__.return_value.chromium.connect_over_cdp.return_value = browser
+        api = MagicMock(sync_playwright=MagicMock(return_value=manager))
+
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', side_effect=[False, True]) as ready, \
+                patch('colab_support.trigger.os.name', 'nt'), \
+                patch('colab_support.trigger.subprocess.Popen') as popen, \
+                patch.object(launcher, '_click_run_all', side_effect=[False, True]) as click_run, \
+                patch.object(launcher, 'try_authorize_drive', return_value=True) as auth:
+            self.assertTrue(launcher._auto_run_browser())
+
+        popen.assert_called_once()
+        self.assertEqual(ready.call_count, 2)
+        context.new_page.assert_not_called()
+        blank.goto.assert_called_once_with(launcher.notebook_url, wait_until='domcontentloaded')
+        self.assertEqual(click_run.call_count, 2)
+        blank.wait_for_timeout.assert_called_once_with(250)
+        auth.assert_called_once()
+
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', return_value=False), \
+                patch('colab_support.trigger.os.name', 'nt'), \
+                patch('colab_support.trigger.subprocess.Popen', side_effect=OSError('missing browser')):
+            self.assertFalse(launcher._auto_run_browser())
+            self.assertFalse(launcher.restore_notebook(launcher.notebook_url))
+            self.assertIsNone(launcher.runtime_connection_state(reopen_missing=True))
+
+        blank.url = 'about:blank'
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', return_value=True), \
+                patch.object(launcher, '_click_run_all', return_value=False) as click_fail:
+            self.assertFalse(launcher._auto_run_browser())
+        self.assertEqual(click_fail.call_count, 20)
+
+    def test_github_warning_dialog_and_multiple_buttons_filtered_by_visibility(self):
+        from colab_support.drive_authorization import DRIVE_BUTTON, DriveAuthorization, click_drive_dialog
+        for label in ('仍然运行', '仍要執行', '照常執行', '仍然執行', 'Run anyway'):
+            self.assertIsNotNone(DRIVE_BUTTON.search(label), label)
+
+        hidden = MagicMock()
+        hidden.is_visible.return_value = False
+        hidden.is_enabled.return_value = True
+        visible = MagicMock()
+        visible.is_visible.return_value = True
+        visible.is_enabled.return_value = True
+
+        locator = MagicMock()
+        locator.count.return_value = 2
+        locator.nth.side_effect = lambda idx: [hidden, visible][idx]
+        page = MagicMock()
+        page.get_by_role.return_value = locator
+        self.assertTrue(click_drive_dialog(page))
+        hidden.click.assert_not_called()
+        visible.click.assert_called_once_with(timeout=3000)
+
+        hidden.is_visible.return_value = True
+        visible.click.reset_mock()
+        self.assertFalse(click_drive_dialog(page))
+        visible.click.assert_not_called()
+
+        actor = DriveAuthorization('https://colab.research.google.com/github/o/r/blob/codex%2Fcolab-poc/n.ipynb')
+        page.url = 'https://colab.research.google.com/github/o/r/blob/codex/colab-poc/n.ipynb#scrollTo=1'
+        page.is_closed.return_value = False
+        self.assertTrue(actor._remember(page))
+
+    def test_conflict_and_corrupted_errors_not_overwritten_by_claim_timeout(self):
+        for err in ('active_run_conflict', 'ack_invalid', 'trigger_state_invalid'):
+            with self.subTest(err=err):
+                self.start()
+                self.monitor.state.status = 'needs_attention'
+                self.monitor.state.last_error = err
+                self.monitor.state.save(self.monitor.state_file)
+                self.clock += 901
+                result = self.monitor.observe(True)
+                self.assertEqual(result.error, err)
+                with self.assertRaisesRegex(ValueError, '只有认领超时'):
+                    self.monitor.recover_expired()
+
+    def test_probe_unavailable_error_is_cleared_when_probe_recovers(self):
+        res_err = self.monitor.observe(None)
+        self.assertEqual(res_err.state, 'probe_unavailable')
+        self.assertEqual(res_err.error, 'probe_unavailable')
+
+        res_off = self.monitor.observe(False)
+        self.assertEqual(res_off.state, 'offline')
+        self.assertIsNone(res_off.error)
+        self.assertIsNone(self.monitor.state.last_error)
+
+        self.monitor.observe(None)
+        self.assertEqual(self.monitor.state.last_error, 'probe_unavailable')
+        res_open = self.monitor.observe(True)
+        self.assertEqual(res_open.state, 'opened')
+        self.assertTrue(res_open.triggered)
+        self.assertIsNone(res_open.error)
+        self.assertIsNone(self.monitor.state.last_error)
+
 
 if __name__ == '__main__':
     unittest.main()

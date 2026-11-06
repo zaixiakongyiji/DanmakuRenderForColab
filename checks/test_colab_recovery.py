@@ -192,6 +192,21 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.monitor.state.last_error, 'runtime_heartbeat_stale')
         self.launcher._auto_run_browser.assert_called_once()
 
+    def test_expired_launch_state_unknown_with_triggered_false_can_recover(self):
+        triggered_at = self.monitor.state.triggered_at
+        for last_error in ('claim_timeout', 'launch_state_unknown'):
+            with self.subTest(last_error=last_error):
+                self.monitor.state.triggered = False
+                self.monitor.state.status = 'needs_attention'
+                self.monitor.state.last_error = last_error
+                self.monitor.state.run_id = self.run_id
+                self.monitor.state.triggered_at = triggered_at
+                self.monitor.state.save(self.monitor.state_file)
+                archive = self.monitor.recover_expired()
+                self.assertTrue(archive.is_file())
+                self.assertIsNone(self.monitor.state.run_id)
+                archive.unlink()
+
 
 class BrowserRecoveryTests(unittest.TestCase):
     def setUp(self):
@@ -280,6 +295,18 @@ class BrowserRecoveryTests(unittest.TestCase):
     def test_pending_restore_navigation_failure_is_reported(self):
         self.context.pages[0].goto.side_effect = RuntimeError('navigation failed')
         self.assertFalse(self.launcher.restore_notebook(self.launcher.notebook_url))
+
+    def test_percent_encoded_notebook_url_matches_decoded_browser_tab(self):
+        encoded = 'https://colab.test/github/owner/repo/blob/codex%2Fcolab-poc/notebooks/colab_record.ipynb'
+        decoded = 'https://colab.test/github/owner/repo/blob/codex/colab-poc/notebooks/colab_record.ipynb#scrollTo=cell'
+        self.page.url = decoded
+        self.context.pages = [self.page]
+        with patch.object(self.launcher, '_connection_state', return_value=False):
+            self.assertIs(self.launcher.runtime_connection_state(
+                notebook_url=encoded, reopen_missing=True), False)
+        self.context.new_page.assert_not_called()
+        self.assertTrue(self.launcher.restore_notebook(encoded))
+        self.page.goto.assert_not_called()
 
 
 if __name__ == '__main__':

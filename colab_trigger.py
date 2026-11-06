@@ -11,8 +11,9 @@ import sys
 from urllib.parse import urlparse
 
 from colab_support.trigger import (
-    DEFAULT_NOTEBOOK_URL, ColabLauncher, TriggerMonitor, TriggerResult,
-    probe_bilibili, validate_room_url,
+    DEFAULT_ENDED_CLOSE_DELAY_SECONDS, DEFAULT_NOTEBOOK_URL,
+    DEFAULT_TERMINAL_CLOSE_DELAY_SECONDS, ColabLauncher, TriggerMonitor,
+    TriggerResult, probe_bilibili, validate_room_url,
 )
 
 FRIENDLY_ERRORS = {
@@ -111,11 +112,16 @@ def parser():
     p.add_argument("--poll-seconds", type=float, default=60)
     p.add_argument("--live-confirmations", type=int, default=2)
     p.add_argument("--offline-confirmations", type=int, default=3)
+    p.add_argument("--terminal-close-delay-seconds", type=float, default=DEFAULT_TERMINAL_CLOSE_DELAY_SECONDS,
+                   help="任务完成且确认释放运行时后，关闭 Notebook 页面的等待秒数（默认 600s）")
+    p.add_argument("--ended-close-delay-seconds", type=float, default=DEFAULT_ENDED_CLOSE_DELAY_SECONDS,
+                   help="确认下播重置监听状态（ended）后，关闭 Notebook 页面的等待秒数（默认 1200s）")
     p.add_argument("--no-browser", action="store_true", help="只写控制文件，不打开浏览器")
     p.add_argument("--once", action="store_true", help="触发一次后退出；自动点击模式等待认领后退出")
     p.add_argument("--auto-run", action="store_true", help="连接专用 loopback CDP 浏览器并点击一次 Run all")
     p.add_argument("--cdp-url", help="专用浏览器 loopback CDP 地址")
     p.add_argument("--google-account", default='', help="Drive 授权所用 Google 账号邮箱；留空仅自动选择唯一账号")
+    p.add_argument("--browser", default='', help="专用 Chrome/Edge 浏览器可执行文件路径；CDP 未就绪时自动拉起")
     p.add_argument("--recover-expired", action="store_true", help="核实旧任务未运行后，归档未认领的过期请求状态并恢复监控")
     p.add_argument("--json", action="store_true", help="使用原始 JSON 格式输出状态日志（用于自动化脚本解析）")
     p.add_argument("--verbose", action="store_true", help="每次轮询均输出日志（即使状态未变化）")
@@ -128,7 +134,8 @@ def main():
     if args.poll_seconds <= 0:
         raise ValueError("轮询间隔必须为正数")
     launcher = ColabLauncher(args.notebook_url, args.drive_sync_root, not args.no_browser,
-                             auto_run=args.auto_run, cdp_url=args.cdp_url, google_account=args.google_account)
+                             auto_run=args.auto_run, cdp_url=args.cdp_url,
+                             google_account=args.google_account, browser_executable=args.browser)
     from colab_support.locks import ProcessLock
     try:
         with ProcessLock(args.state_file.with_suffix('.lock')):
@@ -138,8 +145,12 @@ def main():
 
 
 def monitor_loop(args, room_url, launcher):
-    monitor = TriggerMonitor(room_url, launcher, args.state_file,
-                             args.live_confirmations, args.offline_confirmations)
+    monitor = TriggerMonitor(
+        room_url, launcher, args.state_file,
+        args.live_confirmations, args.offline_confirmations,
+        terminal_close_delay_seconds=getattr(args, 'terminal_close_delay_seconds', DEFAULT_TERMINAL_CLOSE_DELAY_SECONDS),
+        ended_close_delay_seconds=getattr(args, 'ended_close_delay_seconds', DEFAULT_ENDED_CLOSE_DELAY_SECONDS),
+    )
     logger = setup_logger()
     if getattr(args, 'recover_expired', False):
         archive = monitor.recover_expired()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 import uuid
 import webbrowser
@@ -12,8 +13,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
-from .drive_authorization import DriveAuthorizationWatcher, RUN_ALL_BUTTON, click_drive_dialog
+from .drive_authorization import (
+    DriveAuthorizationWatcher, RUN_ALL_BUTTON, click_drive_dialog, normalize_notebook_url,
+)
 
 DEFAULT_NOTEBOOK_URL = (
     "https://colab.research.google.com/github/zaixiakongyiji/"
@@ -21,6 +25,8 @@ DEFAULT_NOTEBOOK_URL = (
 )
 TRIGGER_SCHEMA_VERSION = 2
 TRIGGER_CLAIM_SECONDS = 900
+DEFAULT_TERMINAL_CLOSE_DELAY_SECONDS = 600
+DEFAULT_ENDED_CLOSE_DELAY_SECONDS = 1200
 RUN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
 ACK_STATES = {"accepted", "running", "draining", "success", "failed"}
 CONNECTED_BUTTON = re.compile(
@@ -60,6 +66,18 @@ def validate_cdp(url):
             or parsed.query or parsed.fragment):
         raise ValueError('auto_run_requires_loopback_cdp')
     return url
+
+
+def cdp_ready(address):
+    try:
+        with urlopen(str(address or '').rstrip('/') + '/json/version', timeout=2) as stream:
+            value = json.load(stream)
+        endpoint = urlparse(value.get('webSocketDebuggerUrl', ''))
+        return (isinstance(value.get('Browser'), str) and endpoint.scheme == 'ws'
+                and endpoint.hostname in {'127.0.0.1', 'localhost', '::1'}
+                and endpoint.port == urlparse(address).port)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def claim_request(root, payload, now=None):
@@ -171,6 +189,8 @@ class TriggerState:
     last_error: Optional[str] = None
     ack_status: Optional[str] = None
     notebook_url: Optional[str] = None
+    close_page_at: Optional[str] = None
+    close_notebook_url: Optional[str] = None
 
     @classmethod
     def load(cls, path: Path, room_url: str) -> "TriggerState":
@@ -180,9 +200,14 @@ class TriggerState:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if payload.get('schema_version') != TRIGGER_SCHEMA_VERSION:
                 raise ValueError()
-            if payload.get('notebook_url') is not None and (
-                    not isinstance(payload['notebook_url'], str) or not payload['notebook_url'].strip()):
-                raise ValueError()
+            for url_key in ('notebook_url', 'close_notebook_url'):
+                if payload.get(url_key) is not None and (
+                        not isinstance(payload[url_key], str) or not payload[url_key].strip()):
+                    raise ValueError()
+            if payload.get('close_page_at') is not None:
+                if (not isinstance(payload['close_page_at'], str)
+                        or datetime.fromisoformat(payload['close_page_at']).tzinfo is None):
+                    raise ValueError()
             valid_statuses = {'unknown', 'offline', 'probe_unavailable', 'live', 'dispatching',
                     'needs_attention', 'opened', 'accepted', 'running', 'draining', 'success', 'failed', 'ended'}
             if payload.get('room_url') != room_url:
@@ -250,7 +275,8 @@ class ColabLauncher:
                  drive_sync_root: Optional[Path] = None,
                  open_browser: bool = True,
                  browser: Callable[[str], bool] = webbrowser.open_new_tab,
-                 auto_run: bool = False, cdp_url: Optional[str] = None, google_account: str = ''):
+                 auto_run: bool = False, cdp_url: Optional[str] = None, google_account: str = '',
+                 browser_executable: str = ''):
         self.notebook_url = notebook_url
         self.drive_sync_root = Path(drive_sync_root) if drive_sync_root else None
         self.open_browser = open_browser
@@ -258,12 +284,36 @@ class ColabLauncher:
         self.auto_run = auto_run
         self.cdp_url = cdp_url
         self.google_account = google_account
+        self.browser_executable = browser_executable.strip() if isinstance(browser_executable, str) else ''
         self.authorization = None
         self._pending_run = None
         if auto_run:
             if not self.drive_sync_root or not open_browser:
                 raise ValueError("auto_run_requires_drive_and_browser")
             validate_cdp(cdp_url)
+
+    def _ensure_browser(self) -> bool:
+        if not self.cdp_url:
+            return False
+        if cdp_ready(self.cdp_url):
+            return True
+        if not self.browser_executable or os.name != 'nt':
+            return False
+        port = urlparse(self.cdp_url).port
+        root = Path(__file__).resolve().parents[1]
+        profile = root / '.temp/colab-browser-profile'
+        try:
+            subprocess.Popen([self.browser_executable, '--remote-debugging-address=127.0.0.1',
+                              f'--remote-debugging-port={port}', f'--user-data-dir={profile}',
+                              'about:blank'], cwd=root)
+        except OSError:
+            return False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if cdp_ready(self.cdp_url):
+                return True
+            time.sleep(0.5)
+        return False
 
     def launch(self, room_url: str, run_id: str, triggered_at: str) -> str:
         if self.drive_sync_root:
@@ -289,15 +339,28 @@ class ColabLauncher:
     def _auto_run_browser(self) -> bool:
         if not self.cdp_url:
             raise RuntimeError("auto_run_requires_cdp_url")
+        if self.browser_executable and not self._ensure_browser():
+            return False
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as pw:
                 browser = pw.chromium.connect_over_cdp(self.cdp_url)
                 pages = [p for context in browser.contexts for p in context.pages]
-                base = self.notebook_url.split("#", 1)[0]
-                page = next((p for p in pages if p.url.split("#", 1)[0] == base), None)
-                if page is None:
-                    page = browser.contexts[0].new_page()
+                base = normalize_notebook_url(self.notebook_url)
+                page = next((p for p in pages if normalize_notebook_url(p.url) == base), None)
+                opened_new = page is None
+                if opened_new:
+                    if not browser.contexts:
+                        return False
+                    page = next((p for p in pages if p.url == 'about:blank'), None)
+                    if page is None:
+                        page = browser.contexts[0].new_page()
+                    page.goto(self.notebook_url, wait_until="domcontentloaded")
+                else:
+                    # 若已有遗留 Notebook 页面，先确认未处于连接或运行中，再重新加载刷新会话状态。
+                    if self._connection_state(page) is True:
+                        return False
+                    self._close_related_popups(pages, {page})
                     page.goto(self.notebook_url, wait_until="domcontentloaded")
                 # 等待“全部运行”按钮渲染可见，避免 SPA 加载时差误判
                 try:
@@ -305,10 +368,66 @@ class ColabLauncher:
                     btn.first.wait_for(state="visible", timeout=30000)
                 except Exception:
                     pass
-                if not self._click_run_all(page):
+                deadline = time.monotonic() + (5 if opened_new else 0)
+                for _ in range(20 if opened_new else 1):
+                    if self._click_run_all(page):
+                        break
+                    if time.monotonic() >= deadline:
+                        return False
+                    page.wait_for_timeout(250)
+                else:
                     return False
                 # 监听不阻塞监控主线程，认领回执到达或请求过期时停止。
                 self.try_authorize_drive()
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _close_related_popups(pages, target_pages):
+        for candidate in list(pages):
+            if candidate in target_pages:
+                continue
+            try:
+                if candidate.is_closed():
+                    continue
+                opener = candidate.opener()
+                if opener in target_pages:
+                    candidate.close()
+            except Exception:
+                continue
+
+    def close_notebook_page(self, notebook_url=None) -> bool:
+        """关闭已释放运行时的 Notebook 页面，保留一个 about:blank 标签页维持专用浏览器存活。"""
+        if not self.auto_run or not self.cdp_url:
+            return False
+        if not cdp_ready(self.cdp_url):
+            return False
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp(self.cdp_url, timeout=10000)
+                pages = [p for context in browser.contexts for p in context.pages
+                         if not getattr(p, 'is_closed', lambda: False)()]
+                target = notebook_url or self.notebook_url
+                base = normalize_notebook_url(target)
+                matches = [p for p in pages if normalize_notebook_url(p.url) == base]
+                if not matches:
+                    return True
+                for page in matches:
+                    if self._connection_state(page) is True:
+                        return False
+                self._close_related_popups(pages, set(matches))
+                remaining = [p for context in browser.contexts for p in context.pages
+                             if not getattr(p, 'is_closed', lambda: False)() and p not in matches]
+                if remaining:
+                    for page in matches:
+                        page.close()
+                else:
+                    primary = matches[0]
+                    for extra in matches[1:]:
+                        extra.close()
+                    primary.goto('about:blank', wait_until='domcontentloaded', timeout=10000)
                 return True
         except Exception:
             return False
@@ -317,13 +436,15 @@ class ColabLauncher:
         """显示现有任务的原页面，只导航，绝不重放全部运行。"""
         if not self.auto_run or not self.cdp_url:
             return False
+        if self.browser_executable and not self._ensure_browser():
+            return False
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as pw:
                 browser = pw.chromium.connect_over_cdp(self.cdp_url, timeout=10000)
                 pages = [p for context in browser.contexts for p in context.pages]
-                base = notebook_url.split('#', 1)[0]
-                page = next((p for p in pages if p.url.split('#', 1)[0] == base), None)
+                base = normalize_notebook_url(notebook_url)
+                page = next((p for p in pages if normalize_notebook_url(p.url) == base), None)
                 if page is None:
                     if not browser.contexts:
                         return False
@@ -335,7 +456,7 @@ class ColabLauncher:
                 page.get_by_role('button', name=RUN_ALL_BUTTON).first.wait_for(
                     state='visible', timeout=30000)
                 page.bring_to_front()
-                return page.url.split('#', 1)[0] == base
+                return normalize_notebook_url(page.url) == base
         except Exception:
             return False
 
@@ -394,14 +515,16 @@ class ColabLauncher:
         """返回 True=明确连接、False=明确未连接、None=无法判断。"""
         if not self.auto_run or not self.cdp_url:
             return None
+        if reopen_missing and self.browser_executable and not self._ensure_browser():
+            return None
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as pw:
                 browser = pw.chromium.connect_over_cdp(self.cdp_url, timeout=10000)
                 pages = [p for context in browser.contexts for p in context.pages]
                 target = notebook_url or self.notebook_url
-                base = target.split('#', 1)[0]
-                matches = [p for p in pages if p.url.split('#', 1)[0] == base]
+                base = normalize_notebook_url(target)
+                matches = [p for p in pages if normalize_notebook_url(p.url) == base]
                 if not matches:
                     if not reopen_missing or not browser.contexts:
                         return None
@@ -452,23 +575,58 @@ class TriggerMonitor:
     def __init__(self, room_url: str, launcher: ColabLauncher,
                  state_file: Path = Path(".temp/colab-trigger-state.json"),
                  live_confirmations: int = 2, offline_confirmations: int = 3,
-                 now: Callable[[], float] = time.time):
+                 now: Callable[[], float] = time.time,
+                 terminal_close_delay_seconds: float = DEFAULT_TERMINAL_CLOSE_DELAY_SECONDS,
+                 ended_close_delay_seconds: float = DEFAULT_ENDED_CLOSE_DELAY_SECONDS):
         self.room_url = validate_room_url(room_url)
         if live_confirmations <= 0 or offline_confirmations <= 0:
             raise ValueError("确认次数必须为正数")
+        if terminal_close_delay_seconds < 0 or ended_close_delay_seconds < 0:
+            raise ValueError("关闭页面延迟时间不能为负数")
         self.launcher = launcher
         self.state_file = Path(state_file)
         self.live_confirmations = live_confirmations
         self.offline_confirmations = offline_confirmations
         self.now = now
+        self.terminal_close_delay_seconds = float(terminal_close_delay_seconds)
+        self.ended_close_delay_seconds = float(ended_close_delay_seconds)
         self.state = TriggerState.load(self.state_file, self.room_url)
         self.state.save(self.state_file)
+
+    def _schedule_close_page(self, stamp: datetime, delay_seconds: float, notebook_url: Optional[str]):
+        if not self.launcher.auto_run:
+            return
+        target = (notebook_url or self.launcher.notebook_url or '').split('#', 1)[0]
+        if not target:
+            return
+        self.state.close_notebook_url = target
+        self.state.close_page_at = (stamp + timedelta(seconds=delay_seconds)).isoformat()
+
+    def _check_scheduled_close(self, stamp: datetime):
+        if not self.state.close_page_at:
+            return
+        try:
+            deadline = datetime.fromisoformat(self.state.close_page_at)
+        except ValueError:
+            self.state.close_page_at = None
+            self.state.close_notebook_url = None
+            return
+        if stamp >= deadline:
+            target = self.state.close_notebook_url or self.state.notebook_url or self.launcher.notebook_url
+            if self.launcher.close_notebook_page(target):
+                self.state.close_page_at = None
+                self.state.close_notebook_url = None
 
     def resume_pending(self):
         """监控重启时显示待认领或仍活动的原任务，不发请求或重复点击。"""
         state = self.state
-        if (not self.launcher.auto_run or not state.triggered or not state.run_id
-                or state.status not in {'opened', 'accepted', 'running', 'draining', 'needs_attention'}
+        if not self.launcher.auto_run:
+            return
+        if not state.triggered and not state.run_id:
+            if state.status in {'unknown', 'offline'} and not state.close_page_at:
+                self.launcher.close_notebook_page(state.notebook_url or self.launcher.notebook_url)
+            return
+        if (state.status not in {'opened', 'accepted', 'running', 'draining', 'needs_attention'}
                 or state.last_error in {'active_run_conflict', 'trigger_state_invalid', 'launch_state_unknown'}):
             return
         stamp = datetime.fromtimestamp(self.now(), timezone.utc)
@@ -494,8 +652,9 @@ class TriggerMonitor:
     def recover_expired(self):
         """显式恢复未认领的过期请求；调用方须持有监控状态进程锁。"""
         state = self.state
-        if (state.status not in {'opened', 'needs_attention'} or state.last_error not in {None, 'claim_timeout'}
-                or not state.triggered or not state.run_id or state.ack_status is not None):
+        if (state.status not in {'opened', 'needs_attention'}
+                or state.last_error in {'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}
+                or not state.run_id or state.ack_status is not None):
             raise ValueError('恢复失败：只有认领超时且未收到回执的请求可以恢复。')
         if not self.launcher.drive_sync_root:
             raise ValueError('恢复失败：需要可读取的 Drive 同步目录。')
@@ -532,6 +691,7 @@ class TriggerMonitor:
         if self.launcher.authorization is not None:
             raise ValueError('恢复失败：旧授权监听尚未退出。')
         require_unclaimed()
+        old_notebook_url = state.notebook_url
         # 仅归档本地状态，保留 Drive 的过期请求供核对；不延长有效期。
         archive = self.state_file.with_name(
             self.state_file.stem + '.expired-' + state.run_id + '.bak.json')
@@ -543,6 +703,7 @@ class TriggerMonitor:
         except OSError:
             raise ValueError('恢复失败：无法归档本地状态，请检查备份文件和目录权限。') from None
         self.state = fresh
+        self.launcher.close_notebook_page(old_notebook_url)
         return archive
 
     def observe(self, status: Optional[bool]) -> TriggerResult:
@@ -557,9 +718,15 @@ class TriggerMonitor:
                 if self.state.status == 'needs_attention':
                     self.state.save(self.state_file)
                     return TriggerResult('needs_attention', run_id=self.state.run_id, error=self.state.last_error)
+                if not self.state.close_page_at:
+                    self._schedule_close_page(stamp, self.terminal_close_delay_seconds, self.state.notebook_url)
+                self._check_scheduled_close(stamp)
                 self.state.offline_streak = self.state.offline_streak + 1 if status is False else 0
                 if self.state.offline_streak >= self.offline_confirmations:
+                    old_notebook_url = self.state.close_notebook_url or self.state.notebook_url
                     self.state = TriggerState(self.room_url, status='ended')
+                    self._schedule_close_page(stamp, self.ended_close_delay_seconds, old_notebook_url)
+                    self._check_scheduled_close(stamp)
                 self.state.save(self.state_file)
                 return TriggerResult(self.state.status, run_id=self.state.run_id, error=self.state.last_error)
             if self.state.triggered_at and self.state.ack_status is None:
@@ -567,7 +734,8 @@ class TriggerMonitor:
                     age = (stamp - datetime.fromisoformat(self.state.triggered_at)).total_seconds()
                     if age >= TRIGGER_CLAIM_SECONDS:
                         self.launcher.close()
-                        self.state.status, self.state.last_error = 'needs_attention', 'claim_timeout'
+                        if self.state.last_error not in {'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}:
+                            self.state.status, self.state.last_error = 'needs_attention', 'claim_timeout'
                     elif self.state.status in {'opened', 'needs_attention'} and self.state.last_error not in {
                             'launch_state_unknown', 'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}:
                         self.launcher._pending_run = (self.state.run_id,
@@ -584,8 +752,9 @@ class TriggerMonitor:
             return TriggerResult(self.state.status, run_id=self.state.run_id, error=self.state.last_error)
         if self.state.status == 'needs_attention':
             return TriggerResult('needs_attention', error=self.state.last_error)
+        self._check_scheduled_close(stamp)
         if status is True:
-            self.state.status = 'live'
+            self.state.status, self.state.last_error = 'live', None
             self.state.live_streak += 1
             self.state.offline_streak = 0
             if self.state.live_streak >= self.live_confirmations:
@@ -593,6 +762,8 @@ class TriggerMonitor:
                 self.state.status, self.state.run_id = 'dispatching', run_id
                 self.state.notebook_url = self.launcher.notebook_url.split('#', 1)[0]
                 self.state.triggered_at = stamp.isoformat()
+                self.state.close_page_at = None
+                self.state.close_notebook_url = None
                 # 保存不可自动重试的启动意图，再调用浏览器。
                 self.state.save(self.state_file)
                 try:
@@ -605,7 +776,7 @@ class TriggerMonitor:
                 self.state.save(self.state_file)
                 return TriggerResult('opened', True, run_id, launch_url)
         elif status is False:
-            self.state.status, self.state.live_streak = 'offline', 0
+            self.state.status, self.state.live_streak, self.state.last_error = 'offline', 0, None
         else:
             self.state.status, self.state.last_error = 'probe_unavailable', 'probe_unavailable'
         self.state.save(self.state_file)
@@ -637,7 +808,8 @@ class TriggerMonitor:
                     self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_pending'
                     if (now - updated).total_seconds() >= 60:
                         self.state.last_error = 'runtime_release_unknown'
-                elif self.launcher.runtime_connection_state(notebook_url=self.state.notebook_url) is not False:
+                elif not self.state.close_page_at and self.launcher.runtime_connection_state(
+                        notebook_url=self.state.notebook_url) is not False:
                     self.state.status, self.state.last_error = 'needs_attention', 'runtime_release_unconfirmed'
             if ack['status'] not in {'success', 'failed'} and (now - updated).total_seconds() > 300:
                 self.state.status, self.state.last_error = 'needs_attention', 'runtime_heartbeat_stale'

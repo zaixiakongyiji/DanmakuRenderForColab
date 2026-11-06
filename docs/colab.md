@@ -148,7 +148,7 @@ Windows 可双击仓库根目录的 `start_colab_monitor.cmd`。首次运行：
 python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive"
 ```
 
-自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。首次登录、授权和保存表单可使用 CPU。录制 Notebook 默认选择“读取本地触发请求”，正式副本保存为 GPU 类型，准备完成后断开运行时；需要手动录制时再切换为“手动填写直播间”。监控期间无需 GPU 连接，Run all 在开播后申请运行时。实际 GPU 型号由预检记录：
+自动模式需 Google Drive for desktop 同步目录、专用浏览器 profile 及 loopback CDP。首次登录、授权和保存表单可使用 CPU。录制 Notebook 默认选择“读取本地触发请求”，正式副本保存为 GPU 类型，准备完成后断开运行时；需要手动录制时再切换为“手动填写直播间”。监控期间无需 GPU 连接，平时专用浏览器保持开启但停留在 `about:blank`（不常驻打开 Notebook 页面，避免长挂导致 Google 会话/Token 陈旧触发二次验证），开播触发时才打开或重新加载 Notebook 页面并点击一次 Run all 申请运行时。实际 GPU 型号由预检记录：
 
 ```powershell
 python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync-root "G:\My Drive" --notebook-url "<自己的 Notebook URL>" --auto-run --cdp-url http://127.0.0.1:9222
@@ -156,19 +156,19 @@ python colab_trigger.py --url https://live.bilibili.com/<房间号> --drive-sync
 
 自动浏览器适配依赖本地 Playwright，Windows B站监控可直接安装 `colab_support/monitor_requirements.txt`。连接已有专用浏览器，不启动或控制日常浏览器。CDP 只接受 http 的 127.0.0.1、localhost、::1 和显式端口，不接受外部地址。完整 `requirements.txt` 还包含 Douyu/Douyin 等平台使用的 `quickjs`；Windows Python 3.13 可能没有对应 wheel，B站监控无需安装它。
 
-只对配置的 Notebook 至多点击一次“全部运行/全部執行/Run all”。通过可见按钮、状态区和弹窗判断，运行中、连接中或启动状态无法辨别时交给人工。点击后专用监听线程保持 CDP 连接，每 2 秒检查一次 Drive 授权；直播仍每 60 秒轮询。监听全部 browser.contexts 的 page 事件及目标页面的 popup 事件，并扫描已有页面；只有目标 Notebook 及其 opener 链中的 HTTPS accounts.google.com 页面会自动处理，其他账号窗口不点击。支持简体、繁体和英文的 Drive 连接、继续及允许按钮。
+只对配置的 Notebook 至多点击一次“全部运行/全部執行/Run all”。若浏览器中存在遗留的同地址未连接 Notebook 标签页，触发时先关闭关联弹窗并重新导航加载最新页面；通过可见按钮、状态区和弹窗判断，运行中、连接中或启动状态无法辨别时交给人工。点击后专用监听线程保持 CDP 连接，每 2 秒检查一次 Drive 授权；直播仍每 60 秒轮询。监听全部 browser.contexts 的 page 事件及目标页面的 popup 事件，并扫描已有页面；只有目标 Notebook 及其 opener 链中的 HTTPS accounts.google.com 页面会自动处理，其他账号窗口不点击。支持简体、繁体和英文的 Drive 连接、继续及允许按钮。
 
 命令行可附加 `--google-account "自己的账号邮箱"`；账号列表有多个且未指定、账号不匹配或授权页无法确认配置身份时报告明确原因。密码、验证码、二次验证与未知授权页面保留人工处理。监听在有效同编号回执到达、15 分钟请求窗口结束或本地监控停止时关闭；不会因点击按钮就宣称录制成功，也不自动重启运行时或保活。页面 DOM 可变化，真实账号与浏览器适配仍须另行验收。
 
 `--once --auto-run` 会等待认领后退出，期间授权监听保持活动；认领失败或超时返回非零退出码。仅打开浏览器的 `--once` 保持触发后退出。
 
-监控重启时，尚未过期且未收到回执的已发送请求会保留原运行编号，并补开原 Notebook 页面（优先复用专用浏览器的空白标签）。已认领、运行中和收尾中的任务同样会恢复原页面，不受认领期限限制；页面渲染完成后切换到该标签。此时不会重写请求、延长有效期或再次点击全部运行；未认领时日志显示“已有 Colab 请求，等待认领”。补开页面失败会独立告警，活动任务状态仍按 Drive 回执读取。页面恢复不代表录制已启动，只有认领回执才能确认 Colab 已接收任务；过期且未认领的请求仍走下述显式恢复流程。
+监控重启时，若处于无任务的空闲状态（`unknown`/`offline`），会自动将遗留未连接的 Notebook 页面切回 `about:blank`；尚未过期且未收到回执的已发送请求会保留原运行编号，并补开原 Notebook 页面（优先复用专用浏览器的空白标签）。已认领、运行中和收尾中的任务同样会恢复原页面，不受认领期限限制；页面渲染完成后切换到该标签。此时不会重写请求、延长有效期或再次点击全部运行；未认领时日志显示“已有 Colab 请求，等待认领”。补开页面失败会独立告警，活动任务状态仍按 Drive 回执读取。页面恢复不代表录制已启动，只有认领回执才能确认 Colab 已接收任务；过期且未认领的请求仍走下述显式恢复流程。
 
-`--setup` 只修改设置，保留活动或未确认的请求状态。旧请求认领超时后，先停止监控并核实旧 Notebook 没有活动任务，再执行 `start_colab_monitor.cmd --recover-expired`，无需手动改名状态文件。恢复入口在进程锁内校验原请求已过期、Drive 没有 claim/ack 文件且原 Notebook 明确未连接；通过后归档本地状态到 `.temp/colab-trigger-state.expired-<run_id>.bak.json`，重新累计开播确认次数。原 Notebook 标签已关闭时，恢复入口会在专用浏览器重新打开原地址，等待最多 15 秒识别连接状态，不点击全部运行或连接按钮；同地址有多个标签时，任一仍连接或状态未知都会阻止恢复。请求文件、过期时间和历史结果保持原值。有认领、回执、未知运行时状态或损坏请求时拒绝恢复；错误信息分别提示仍连接和无法确认，后者需检查登录或弹窗。新请求记录原 Notebook 地址，修改启动设置后仍检查原地址；旧版状态不含该地址，执行恢复前须由本人核实旧副本，再检查当前配置的 Notebook。
+`--setup` 只修改设置，保留活动或未确认的请求状态。旧请求认领超时后，先停止监控并核实旧 Notebook 没有活动任务，再执行 `start_colab_monitor.cmd --recover-expired`，无需手动改名状态文件。恢复入口在进程锁内校验原请求已过期、Drive 没有 claim/ack 文件且原 Notebook 明确未连接；通过后归档本地状态到 `.temp/colab-trigger-state.expired-<run_id>.bak.json`，将已核实未连接的旧 Notebook 页面收起为 `about:blank`，重新累计开播确认次数。原 Notebook 标签已关闭时，恢复入口会在专用浏览器重新打开原地址，等待最多 15 秒识别连接状态，不点击全部运行或连接按钮；同地址有多个标签时，任一仍连接或状态未知都会阻止恢复。请求文件、过期时间和历史结果保持原值。有认领、回执、未知运行时状态或损坏请求时拒绝恢复；错误信息分别提示仍连接和无法确认，后者需检查登录或弹窗。新请求记录原 Notebook 地址，修改启动设置后仍检查原地址；旧版状态不含该地址，执行恢复前须由本人核实旧副本，再检查当前配置的 Notebook。
 
 自动模式在⑦完成结果汇总和媒体校验后保存最终清单与回执，随后调用 `google.colab.runtime.unassign()`；⑧仅供手动模式检查。失败任务先补存尚未备份的已关闭媒体到 `recovery/`，不复制 Cookie、私有配置和原始 console 日志。保存无法完成或监督器仍活动时不释放，保留唯一副本并报告 `needs_attention`。认领前的授权、源码下载等错误无法保证自动释放，15 分钟认领超时后人工检查。
 
-清单和回执增加 `runtime_release.status`：`requested` 表示释放意图已保存并将请求释放，`unknown` 表示持久化或调用异常；事件名称为 `runtime_release_requested`，不是任务成功状态。任务的 `success/failed` 保持原语义。请求发出后无法从已结束内核确认释放；本地在最终回执至少 60 秒后只读检查指定 Notebook，明确未连接才允许重新武装，仍连接或无法判断进入 `needs_attention`，不重复执行。
+清单和回执增加 `runtime_release.status`：`requested` 表示释放意图已保存并将请求释放，`unknown` 表示持久化或调用异常；事件名称为 `runtime_release_requested`，不是任务成功状态。任务的 `success/failed` 保持原语义。请求发出后无法从已结束内核确认释放；本地在最终回执至少 60 秒后只读检查指定 Notebook，明确未连接才允许重新武装，仍连接或无法判断进入 `needs_attention`，不重复执行。确认运行时已断开后，若任务停留在终态（`success`/`failed`）等待下播确认，默认满 10 分钟（`--terminal-close-delay-seconds 600`）自动关闭该 Notebook 页面；当连续确认下播进入 `ended` 重置监听状态时，默认等待 20 分钟（`--ended-close-delay-seconds 1200`）后自动关闭该 Notebook 页面（最后一个标签页导航回 `about:blank` 以保持专用浏览器存活，异常状态 `needs_attention` 绝不自动关闭页面）。
 
 CPU 准备阶段的 Drive 授权不保证新 GPU 运行时免授权。本地在上述限定范围内推进已登录账号的 Drive 授权；密码和二次验证仍由本人完成。临时磁盘内容会随运行时释放丢失，结果检查使用 Drive。上述机制只验证挂载目录读回一致性，不承诺服务端持久性。
 

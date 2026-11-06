@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from colab_support.locks import ProcessLock
+from colab_support.locks import ProcessAlreadyRunningError, ProcessLock
 from colab_support.trigger import atomic_json, validate_cdp, validate_room_url
 
 ROOT = Path(__file__).resolve().parent
@@ -187,7 +187,8 @@ def trigger_command(value, recover_expired=False):
             '--url', task_room(value['task_config']),
             '--drive-sync-root', value['drive_sync_root'],
             '--notebook-url', value['notebook_url'], '--auto-run',
-            '--cdp-url', value['cdp_url'], '--google-account', value.get('google_account', '')]
+            '--cdp-url', value['cdp_url'], '--google-account', value.get('google_account', ''),
+            '--browser', value.get('browser', '')]
     if recover_expired:
         command.append('--recover-expired')
     return command
@@ -215,6 +216,9 @@ if __name__ == '__main__':
         raise SystemExit(main())
     except KeyboardInterrupt:
         print('已停止本地启动入口。')
+        raise SystemExit(0)
+    except ProcessAlreadyRunningError:
+        print('监控已在运行，无需重复启动。需要重新配置时，请先停止现有监控。')
         raise SystemExit(0)
     except (ValueError, OSError, RuntimeError):
         # 锁和 IO 错误可能包含私有路径，避免输出原始异常。

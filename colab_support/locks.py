@@ -3,6 +3,10 @@ import os
 from pathlib import Path
 
 
+class ProcessAlreadyRunningError(RuntimeError):
+    pass
+
+
 class ProcessLock:
     def __init__(self, path):
         self.path = Path(path)
@@ -26,7 +30,7 @@ class ProcessLock:
         except OSError:
             self.stream.close()
             self.stream = None
-            raise RuntimeError('process_already_running') from None
+            raise ProcessAlreadyRunningError('process_already_running') from None
         return self
 
     def __exit__(self, *args):

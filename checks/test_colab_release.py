@@ -309,6 +309,146 @@ class BrowserReleaseTests(unittest.TestCase):
                 self.assertEqual(monitor.observe(False).error, 'runtime_release_unknown')
                 self.assertIsNotNone(monitor.state.run_id)
 
+    def test_terminal_closes_after_10m_and_ended_closes_after_20m(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            clock = [datetime.now(timezone.utc).timestamp()]
+            launcher = ColabLauncher('https://colab.test/notebook', root, auto_run=True,
+                                     cdp_url='http://127.0.0.1:9222')
+            launcher._auto_run_browser = Mock(return_value=True)
+            launcher.runtime_connection_state = Mock(return_value=False)
+            launcher.close_notebook_page = Mock(return_value=True)
+            monitor = TriggerMonitor('https://live.bilibili.com/1', launcher, root / 'state.json',
+                                     1, 2, now=lambda: clock[0])
+            monitor.observe(True)
+            ack = control_paths(root, monitor.state.run_id)[2]
+            write_ack(ack, monitor.state.run_id, 'success')
+            value = json.loads(ack.read_text())
+            value['runtime_release'] = {'status': 'requested'}
+            atomic_json(ack, value)
+
+            # 满 61s 确认运行时断开，但主播仍在直播（未进入 ended），开始 10 分钟（600s）计时
+            clock[0] += 61
+            self.assertEqual(monitor.observe(True).state, 'success')
+            self.assertIsNotNone(monitor.state.close_page_at)
+            launcher.close_notebook_page.assert_not_called()
+
+            # 599s 时未到 10 分钟，不关页；由于已进入延迟关页计划，不再重复调用 runtime_connection_state
+            clock[0] += 599
+            monitor.observe(True)
+            launcher.close_notebook_page.assert_not_called()
+            self.assertEqual(launcher.runtime_connection_state.call_count, 1)
+
+            # 满 600s（10 分钟），自动关闭 Notebook 页面
+            clock[0] += 1
+            monitor.observe(True)
+            launcher.close_notebook_page.assert_called_once_with('https://colab.test/notebook')
+            self.assertIsNone(monitor.state.close_page_at)
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            clock = [datetime.now(timezone.utc).timestamp()]
+            launcher = ColabLauncher('https://colab.test/notebook', root, auto_run=True,
+                                     cdp_url='http://127.0.0.1:9222')
+            launcher._auto_run_browser = Mock(return_value=True)
+            launcher.runtime_connection_state = Mock(return_value=False)
+            launcher.close_notebook_page = Mock(return_value=True)
+            monitor = TriggerMonitor('https://live.bilibili.com/1', launcher, root / 'state.json',
+                                     1, 2, now=lambda: clock[0])
+            monitor.observe(True)
+            ack = control_paths(root, monitor.state.run_id)[2]
+            write_ack(ack, monitor.state.run_id, 'success')
+            value = json.loads(ack.read_text())
+            value['runtime_release'] = {'status': 'requested'}
+            atomic_json(ack, value)
+
+            # 第 1 次下播确认（满 61s）
+            clock[0] += 61
+            self.assertEqual(monitor.observe(False).state, 'success')
+            launcher.close_notebook_page.assert_not_called()
+
+            # 第 2 次下播确认，进入 ended，重置为 20 分钟（1200s）后关页
+            clock[0] += 60
+            self.assertEqual(monitor.observe(False).state, 'ended')
+            self.assertIsNone(monitor.state.run_id)
+            self.assertIsNotNone(monitor.state.close_page_at)
+            launcher.close_notebook_page.assert_not_called()
+
+            # 1199s 时未满 20 分钟
+            clock[0] += 1199
+            monitor.observe(False)
+            launcher.close_notebook_page.assert_not_called()
+
+            # 满 1200s（20 分钟）后关闭页面
+            clock[0] += 1
+            monitor.observe(False)
+            launcher.close_notebook_page.assert_called_once_with('https://colab.test/notebook')
+            self.assertIsNone(monitor.state.close_page_at)
+            self.assertIsNone(monitor.state.close_notebook_url)
+
+    def test_close_notebook_page_navigates_last_tab_to_blank_and_closes_popups(self):
+        import sys
+        launcher = ColabLauncher('https://colab.test/notebook', Path('.'),
+                                 auto_run=True, cdp_url='http://127.0.0.1:9222')
+        nb_page = MagicMock(url='https://colab.test/notebook#scrollTo=1')
+        nb_page.is_closed.return_value = False
+        nb_page.opener.return_value = None
+        popup = MagicMock(url='https://accounts.google.com/signin/oauth')
+        popup.is_closed.return_value = False
+        popup.opener.return_value = nb_page
+        context = MagicMock(pages=[nb_page, popup])
+
+        def close_popup():
+            popup.is_closed.return_value = True
+        popup.close.side_effect = close_popup
+
+        browser = MagicMock(contexts=[context])
+        manager = MagicMock()
+        manager.__enter__.return_value.chromium.connect_over_cdp.return_value = browser
+        api = MagicMock(sync_playwright=MagicMock(return_value=manager))
+
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', return_value=True), \
+                patch.object(launcher, '_connection_state', return_value=False):
+            self.assertTrue(launcher.close_notebook_page())
+
+        popup.close.assert_called_once()
+        nb_page.close.assert_not_called()
+        nb_page.goto.assert_called_once_with('about:blank', wait_until='domcontentloaded', timeout=10000)
+
+        # 若仍处于连接状态，拒绝关闭页面
+        nb_page.goto.reset_mock()
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', return_value=True), \
+                patch.object(launcher, '_connection_state', return_value=True):
+            self.assertFalse(launcher.close_notebook_page())
+        nb_page.goto.assert_not_called()
+
+    def test_auto_run_reloads_existing_disconnected_tab_and_closes_old_popups(self):
+        import sys
+        launcher = ColabLauncher('https://colab.test/notebook', Path('.'),
+                                 auto_run=True, cdp_url='http://127.0.0.1:9222')
+        existing = MagicMock(url='https://colab.test/notebook#scrollTo=1')
+        existing.is_closed.return_value = False
+        popup = MagicMock(url='https://accounts.google.com/v3/signin/challenge')
+        popup.is_closed.return_value = False
+        popup.opener.return_value = existing
+        context = MagicMock(pages=[existing, popup])
+        browser = MagicMock(contexts=[context])
+        manager = MagicMock()
+        manager.__enter__.return_value.chromium.connect_over_cdp.return_value = browser
+        api = MagicMock(sync_playwright=MagicMock(return_value=manager))
+
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', return_value=True), \
+                patch.object(launcher, '_connection_state', return_value=False), \
+                patch.object(launcher, '_click_run_all', return_value=True), \
+                patch.object(launcher, 'try_authorize_drive', return_value=True):
+            self.assertTrue(launcher._auto_run_browser())
+
+        popup.close.assert_called_once()
+        existing.goto.assert_called_once_with(launcher.notebook_url, wait_until='domcontentloaded')
+
 
 class LauncherSetupTests(unittest.TestCase):
     def test_monitor_starts_browser_blank_until_live_without_prepare(self):

@@ -3,28 +3,40 @@ import json
 import re
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 DRIVE_BUTTON = re.compile(
-    r'^(连接到 Google 云端硬盘|連接到 Google 雲端硬碟|Connect to Google Drive)$', re.I)
+    r'^(连接到 Google 云端硬盘|連接到 Google 雲端硬碟|Connect to Google Drive|'
+    r'仍然运行|仍要執行|照常執行|仍然執行|Run anyway)$', re.I)
 CONSENT_BUTTON = re.compile(r'^(继续|繼續|Continue|允许|允許|Allow)$', re.I)
 RUN_ALL_BUTTON = re.compile(r'^(全部运行|全部執行|執行全部|Run all)(\s|$)', re.I)
 ACCOUNT_CHOOSER = re.compile(r'^(选择账号|选择帐号|選擇帳戶|選擇帳號|Choose an account)$', re.I)
 
 
+def normalize_notebook_url(url):
+    return unquote(str(url or '').split('#', 1)[0])
+
+
 def click_drive_dialog(page, may_act=lambda: True):
     button = page.get_by_role('button', name=DRIVE_BUTTON)
-    if (button.count() == 1 and button.first.is_visible() and button.first.is_enabled()
-            and may_act()):
-        button.first.click(timeout=3000)
+    count = button.count()
+    if count == 1:
+        if button.first.is_visible() and button.first.is_enabled() and may_act():
+            button.first.click(timeout=3000)
+            return True
+        return False
+    visible = [button.nth(index) for index in range(count)
+               if button.nth(index).is_visible() and button.nth(index).is_enabled()]
+    if len(visible) == 1 and may_act():
+        visible[0].click(timeout=3000)
         return True
     return False
 
 
 class DriveAuthorization:
     def __init__(self, notebook_url, google_account='', may_act=lambda: True):
-        self.notebook_url = notebook_url.split('#', 1)[0]
+        self.notebook_url = normalize_notebook_url(notebook_url)
         self.google_account = google_account.strip().lower()
         self.may_act = may_act
         self.error = None
@@ -47,7 +59,7 @@ class DriveAuthorization:
         try:
             if page.is_closed():
                 return False
-            related = page.url.split('#', 1)[0] == self.notebook_url
+            related = normalize_notebook_url(page.url) == self.notebook_url
             if not related:
                 opener = page.opener()
                 related = opener is not None and self._remember(opener)
@@ -132,7 +144,7 @@ class DriveAuthorization:
                         return acted
                     if page.is_closed() or not self._remember(page):
                         continue
-                    if page.url.split('#', 1)[0] == self.notebook_url:
+                    if normalize_notebook_url(page.url) == self.notebook_url:
                         acted |= click_drive_dialog(page, self.may_act)
                     else:
                         acted |= self._oauth(page)
