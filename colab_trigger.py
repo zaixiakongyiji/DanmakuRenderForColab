@@ -8,12 +8,13 @@ from pathlib import Path
 
 import logging
 import sys
+from typing import Optional
 from urllib.parse import urlparse
 
 from colab_support.trigger import (
     DEFAULT_ENDED_CLOSE_DELAY_SECONDS, DEFAULT_NOTEBOOK_URL,
     DEFAULT_TERMINAL_CLOSE_DELAY_SECONDS, ColabLauncher, TriggerMonitor,
-    TriggerResult, probe_bilibili, validate_room_url,
+    TriggerResult, check_playwright_loopback, probe_bilibili, validate_room_url,
 )
 
 FRIENDLY_ERRORS = {
@@ -22,7 +23,7 @@ FRIENDLY_ERRORS = {
     "runtime_release_unconfirmed": "Colab 运行时释放未确认",
     "runtime_release_pending": "等待 Colab 释放运行时",
     "runtime_release_unknown": "Colab 运行时释放状态未知",
-    "launch_state_unknown": "Colab 启动状态未知",
+    "launch_state_unknown": "Colab 启动状态未知；核实旧任务未运行并满 15 分钟过期后，执行 start_colab_monitor.cmd --recover-expired 恢复",
     "pending_notebook_unavailable": "待认领请求的原 Notebook 页面恢复失败；请检查专用浏览器，未重复点击全部运行",
     "ack_invalid": "回执文件无效或损坏",
     "probe_unavailable": "网络探测不可用",
@@ -65,11 +66,25 @@ def resolve_target_info(room_url: str) -> tuple[str, str]:
     return f"房间 {room_id}", room_id
 
 
-def format_trigger_message(target_name: str, result: TriggerResult) -> tuple[int, str]:
+def _browser_error_detail(launcher, error: Optional[str]) -> Optional[str]:
+    """仅对浏览器/授权相关异常读取启动器保留的脱敏诊断文本。"""
+    if error not in {"launch_state_unknown", "authorization_browser_unavailable"}:
+        return None
+    detail = getattr(launcher, "last_browser_error", None)
+    return detail if isinstance(detail, str) and detail else None
+
+
+def format_trigger_message(target_name: str, result: TriggerResult,
+                           detail: Optional[str] = None) -> tuple[int, str]:
     """将 TriggerResult 转换为直观的人类可读日志文本与对应日志级别。"""
     run_info = f" (run_id: {result.run_id})" if result.run_id else ""
     error_desc = FRIENDLY_ERRORS.get(result.error, result.error) if result.error else ""
-    error_info = f"，原因: {error_desc}" if error_desc else ""
+    detail_suffix = (
+        f"（详情: {detail}）"
+        if detail and result.error in {"launch_state_unknown", "authorization_browser_unavailable"}
+        else ""
+    )
+    error_info = f"，原因: {error_desc}{detail_suffix}" if error_desc else ""
 
     if result.triggered:
         return logging.INFO, f"[{target_name}] 检测到直播开始！已发送 Colab 运行请求，等待认领{run_info}"
@@ -133,6 +148,8 @@ def main():
     room_url = validate_room_url(args.url)
     if args.poll_seconds <= 0:
         raise ValueError("轮询间隔必须为正数")
+    if args.auto_run and not args.no_browser:
+        check_playwright_loopback()
     launcher = ColabLauncher(args.notebook_url, args.drive_sync_root, not args.no_browser,
                              auto_run=args.auto_run, cdp_url=args.cdp_url,
                              google_account=args.google_account, browser_executable=args.browser)
@@ -159,11 +176,20 @@ def monitor_loop(args, room_url, launcher):
         else:
             logger.info('已归档未认领的过期请求状态：%s；重新确认开播状态。', archive)
     if monitor.resume_pending() is False:
-        if args.json:
-            print(json.dumps({'event': 'notebook_page_restore_failed',
-                              'run_id': monitor.state.run_id}, ensure_ascii=False), flush=True)
+        raw_detail = getattr(launcher, 'last_browser_error', None)
+        detail = raw_detail if isinstance(raw_detail, str) and raw_detail else ''
+        if monitor.state.run_id:
+            event_payload = {'event': 'notebook_page_restore_failed', 'run_id': monitor.state.run_id}
+            warning_text = '原 Notebook 页面未能显示，请检查专用浏览器；任务状态继续按 Drive 回执读取。'
         else:
-            logger.warning('原 Notebook 页面未能显示，请检查专用浏览器；任务状态继续按 Drive 回执读取。')
+            event_payload = {'event': 'idle_notebook_close_failed'}
+            warning_text = '启动时未能关闭遗留 Notebook 页面，请检查专用浏览器。'
+        if detail:
+            event_payload['detail'] = detail
+        if args.json:
+            print(json.dumps(event_payload, ensure_ascii=False), flush=True)
+        else:
+            logger.warning(f'{warning_text}（详情: {detail}）' if detail else warning_text)
     target_name, room_id = resolve_target_info(room_url)
 
     if not args.json:
@@ -175,12 +201,16 @@ def monitor_loop(args, room_url, launcher):
 
     while True:
         result = monitor.observe(probe_bilibili(room_url))
+        detail = _browser_error_detail(launcher, result.error)
         if args.json:
-            print(json.dumps({"status": result.state, "triggered": result.triggered,
-                              "run_id": result.run_id, "error": result.error}, ensure_ascii=False), flush=True)
+            payload = {"status": result.state, "triggered": result.triggered,
+                       "run_id": result.run_id, "error": result.error}
+            if detail:
+                payload["detail"] = detail
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
         else:
-            level, msg = format_trigger_message(target_name, result)
-            signature = (result.state, result.triggered, result.run_id, result.error)
+            level, msg = format_trigger_message(target_name, result, detail=detail)
+            signature = (result.state, result.triggered, result.run_id, result.error, detail)
             verbose = getattr(args, 'verbose', False)
             if verbose or signature != last_log_signature:
                 logger.log(level, msg)

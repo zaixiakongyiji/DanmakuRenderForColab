@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from colab_support.locks import ProcessAlreadyRunningError, ProcessLock
-from colab_support.trigger import atomic_json, validate_cdp, validate_room_url
+from colab_support.trigger import atomic_json, check_playwright_loopback, validate_cdp, validate_room_url
 
 ROOT = Path(__file__).resolve().parent
 SETTINGS = ROOT / '.temp/colab-monitor-settings.json'
@@ -201,6 +201,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if importlib.util.find_spec('playwright') is None:
         raise ValueError('缺少 Playwright。请先执行：python -m pip install -r colab_support/monitor_requirements.txt')
+    check_playwright_loopback()
     with ProcessLock(ROOT / '.temp/colab-monitor-launcher.lock'):
         first_setup = args.setup or not SETTINGS.exists()
         value = load_settings(args.setup)

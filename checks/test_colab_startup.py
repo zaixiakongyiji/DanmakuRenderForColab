@@ -229,6 +229,21 @@ class AuthorizationTests(unittest.TestCase):
             self.assertIsNone(watcher.error)
             browser.contexts[0].remove_listener.assert_called_once()
 
+    def test_watcher_records_error_detail_on_browser_exception(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ack = Path(folder) / 'ack.json'
+            watcher = DriveAuthorizationWatcher(self.url, 'http://127.0.0.1:9222', '',
+                time.time() + 900, ack, '20261011-000000-abcdef12')
+            context = Mock()
+            context.__enter__ = Mock(side_effect=ConnectionError('Unexpected peer connection'))
+            context.__exit__ = Mock(return_value=False)
+            api = SimpleNamespace(sync_playwright=Mock(return_value=context))
+            with patch.dict(sys.modules, {'playwright.sync_api': api}):
+                watcher._run()
+            self.assertEqual(watcher.error, 'authorization_browser_unavailable')
+            self.assertIn('Unexpected peer connection', watcher.last_error_detail or '')
+            self.assertIn('Proxifier', watcher.last_error_detail or '')
+
     def test_watcher_stops_at_expiry_and_ignores_other_run_ack(self):
         with tempfile.TemporaryDirectory() as folder:
             ack = Path(folder) / 'ack.json'

@@ -1,9 +1,55 @@
 """专用 CDP 浏览器中，仅推进目标 Notebook 发起的 Drive 授权。"""
 import json
+import logging
 import re
 import threading
 import time
 from urllib.parse import unquote, urlparse
+
+_log = logging.getLogger(__name__)
+_log.addHandler(logging.NullHandler())
+
+_URL_RE = re.compile(r'https?://(?!(?:127\.0\.0\.1|localhost)(?:[:/\s]|$))\S+')
+_PATH_RE = re.compile(r'[A-Za-z]:\\[^\s"\']+|/(?:Users|home|tmp|var|mnt|Volumes)/[^\s"\']+')
+
+
+def _is_loopback_interception_error(exc: BaseException) -> bool:
+    """判断异常或其因果链是否为本地回环被代理/防火墙劫持导致的连接异常。"""
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionError) and 'unexpected peer connection' in str(cur).lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def format_browser_exception(exc: BaseException) -> str:
+    """将浏览器或 Playwright 异常格式化为不含敏感路径与私有 URL 的诊断文本。"""
+    if _is_loopback_interception_error(exc):
+        return (
+            '本地回环通信异常（ConnectionError: Unexpected peer connection），'
+            'Playwright 无法初始化；若使用 Proxifier 等代理/防火墙工具，'
+            '请关闭直连拦截（如 Handle Direct Connections）并放行 127.0.0.1'
+        )
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError) or 'TimeoutError' in name:
+        return f'{name}（页面或元素等待超时）'
+    if isinstance(exc, OSError):
+        msg = _scrub_sensitive_text(exc.strerror or '')
+        if msg:
+            return f'{name}: {msg}'
+        return f'{name} (errno={exc.errno})' if exc.errno is not None else name
+    first_line = next((line.strip() for line in str(exc).splitlines() if line.strip()), '')
+    cleaned = _scrub_sensitive_text(first_line)[:160]
+    return f'{name}: {cleaned}' if cleaned else name
+
+
+def _scrub_sensitive_text(text: str) -> str:
+    """脱敏诊断文本中的私有 URL 与本地路径，保留 loopback 调试地址。"""
+    text = _URL_RE.sub('<url>', text)
+    return _PATH_RE.sub('<path>', text)
 
 
 DRIVE_BUTTON = re.compile(
@@ -161,6 +207,7 @@ class DriveAuthorizationWatcher:
         self.google_account, self.expires_at = google_account, expires_at
         self.ack_path, self.run_id = ack_path, run_id
         self.error = None
+        self.last_error_detail = None
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name='colab-drive-authorization', daemon=True)
 
@@ -187,6 +234,7 @@ class DriveAuthorizationWatcher:
         return False
 
     def _run(self):
+        self.last_error_detail = None
         actor = DriveAuthorization(self.notebook_url, self.google_account,
                                    may_act=lambda: not self._finished())
         try:
@@ -196,18 +244,23 @@ class DriveAuthorizationWatcher:
                 try:
                     while not self._finished():
                         if not browser.is_connected():
+                            self.last_error_detail = '专用浏览器连接已断开'
                             self.error = 'authorization_browser_unavailable'
                             return
                         actor.scan(browser)
                         self.error = actor.error
                         pages = [p for c in browser.contexts for p in c.pages if not p.is_closed()]
                         if not pages:
+                            self.last_error_detail = '专用浏览器没有打开的页面'
                             self.error = 'authorization_browser_unavailable'
                             return
                         # Playwright 的等待会分发 page/popup 事件；不使用 time.sleep 阻塞事件。
                         pages[0].wait_for_timeout(2000)
                 finally:
                     actor.close()
-        except Exception:
+        except Exception as exc:
+            detail = format_browser_exception(exc)
+            _log.warning('Drive 授权监听浏览器异常: %s', detail)
             if not self._finished():
+                self.last_error_detail = detail
                 self.error = 'authorization_browser_unavailable'

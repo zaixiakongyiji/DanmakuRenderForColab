@@ -308,6 +308,28 @@ class BrowserRecoveryTests(unittest.TestCase):
         self.assertTrue(self.launcher.restore_notebook(encoded))
         self.page.goto.assert_not_called()
 
+    def test_recover_expired_surfaces_browser_error_detail_when_state_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = datetime.now(timezone.utc).timestamp()
+            launcher = ColabLauncher('https://colab.test/old-notebook', root,
+                                     auto_run=True, cdp_url='http://127.0.0.1:9222')
+            monitor = TriggerMonitor('https://live.bilibili.com/1', launcher,
+                                     root / 'state.json', 1, now=lambda: clock)
+            manager = MagicMock()
+            manager.__enter__.side_effect = ConnectionError('Unexpected peer connection')
+            api = MagicMock(sync_playwright=MagicMock(return_value=manager))
+            with patch.dict(sys.modules, {'playwright.sync_api': api}):
+                monitor.observe(True)
+                clock += 901
+                monitor.observe(True)
+                with self.assertRaises(ValueError) as ctx:
+                    monitor.recover_expired()
+            msg = str(ctx.exception)
+            self.assertIn('无法确认旧 Notebook 状态', msg)
+            self.assertIn('Unexpected peer connection', msg)
+            self.assertIn('Proxifier', msg)
+
 
 if __name__ == '__main__':
     unittest.main()

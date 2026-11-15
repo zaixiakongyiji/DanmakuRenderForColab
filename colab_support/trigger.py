@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import socket
 import subprocess
 import time
 import uuid
@@ -16,8 +18,12 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from .drive_authorization import (
-    DriveAuthorizationWatcher, RUN_ALL_BUTTON, click_drive_dialog, normalize_notebook_url,
+    DriveAuthorizationWatcher, RUN_ALL_BUTTON, _is_loopback_interception_error,
+    _scrub_sensitive_text, click_drive_dialog, format_browser_exception, normalize_notebook_url,
 )
+
+_log = logging.getLogger(__name__)
+_log.addHandler(logging.NullHandler())
 
 DEFAULT_NOTEBOOK_URL = (
     "https://colab.research.google.com/github/zaixiakongyiji/"
@@ -66,6 +72,24 @@ def validate_cdp(url):
             or parsed.query or parsed.fragment):
         raise ValueError('auto_run_requires_loopback_cdp')
     return url
+
+
+def check_playwright_loopback() -> None:
+    """校验本地 socketpair 回环通信，避免 Playwright 事件循环初始化静默失败。"""
+    left = right = None
+    try:
+        left, right = socket.socketpair()
+    except OSError as exc:
+        if _is_loopback_interception_error(exc):
+            raise ValueError(format_browser_exception(exc)) from None
+        raise ValueError(f'本地回环自检失败（{format_browser_exception(exc)}），Playwright 可能无法正常工作。') from None
+    finally:
+        for sock in (left, right):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
 
 def cdp_ready(address):
@@ -287,10 +311,20 @@ class ColabLauncher:
         self.browser_executable = browser_executable.strip() if isinstance(browser_executable, str) else ''
         self.authorization = None
         self._pending_run = None
+        self.last_browser_error: Optional[str] = None
         if auto_run:
             if not self.drive_sync_root or not open_browser:
                 raise ValueError("auto_run_requires_drive_and_browser")
             validate_cdp(cdp_url)
+
+    def _record_browser_error(self, action: str, exc: Optional[BaseException] = None,
+                              reason: Optional[str] = None) -> str:
+        """记录并脱敏最近一次浏览器操作异常，供日志与恢复提示使用。"""
+        detail = format_browser_exception(exc) if exc is not None else _scrub_sensitive_text(str(reason or '').strip())
+        self.last_browser_error = detail or None
+        if self.last_browser_error:
+            _log.warning('浏览器操作失败 (%s): %s', action, self.last_browser_error)
+        return detail
 
     def _ensure_browser(self) -> bool:
         if not self.cdp_url:
@@ -298,6 +332,7 @@ class ColabLauncher:
         if cdp_ready(self.cdp_url):
             return True
         if not self.browser_executable or os.name != 'nt':
+            self._record_browser_error('_ensure_browser', reason='专用浏览器 CDP 未就绪，且当前环境无法自动拉起浏览器')
             return False
         port = urlparse(self.cdp_url).port
         root = Path(__file__).resolve().parents[1]
@@ -306,16 +341,19 @@ class ColabLauncher:
             subprocess.Popen([self.browser_executable, '--remote-debugging-address=127.0.0.1',
                               f'--remote-debugging-port={port}', f'--user-data-dir={profile}',
                               'about:blank'], cwd=root)
-        except OSError:
+        except OSError as exc:
+            self._record_browser_error('_ensure_browser', exc=exc)
             return False
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if cdp_ready(self.cdp_url):
                 return True
             time.sleep(0.5)
+        self._record_browser_error('_ensure_browser', reason='启动专用浏览器后等待 CDP 就绪超时（15s）')
         return False
 
     def launch(self, room_url: str, run_id: str, triggered_at: str) -> str:
+        self.last_browser_error = None
         if self.drive_sync_root:
             request, claim, ack = control_paths(self.drive_sync_root, run_id)
             if request.exists() or claim.exists() or ack.exists():
@@ -337,6 +375,7 @@ class ColabLauncher:
         return self.notebook_url
 
     def _auto_run_browser(self) -> bool:
+        self.last_browser_error = None
         if not self.cdp_url:
             raise RuntimeError("auto_run_requires_cdp_url")
         if self.browser_executable and not self._ensure_browser():
@@ -351,6 +390,7 @@ class ColabLauncher:
                 opened_new = page is None
                 if opened_new:
                     if not browser.contexts:
+                        self._record_browser_error('_auto_run_browser', reason='专用浏览器未打开任何上下文')
                         return False
                     page = next((p for p in pages if p.url == 'about:blank'), None)
                     if page is None:
@@ -359,6 +399,7 @@ class ColabLauncher:
                 else:
                     # 若已有遗留 Notebook 页面，先确认未处于连接或运行中，再重新加载刷新会话状态。
                     if self._connection_state(page) is True:
+                        self._record_browser_error('_auto_run_browser', reason='现有 Notebook 页面已处于连接或运行状态，未重复点击')
                         return False
                     self._close_related_popups(pages, {page})
                     page.goto(self.notebook_url, wait_until="domcontentloaded")
@@ -373,14 +414,17 @@ class ColabLauncher:
                     if self._click_run_all(page):
                         break
                     if time.monotonic() >= deadline:
+                        self._record_browser_error('_auto_run_browser', reason='未找到或未能点击“全部运行”按钮')
                         return False
                     page.wait_for_timeout(250)
                 else:
+                    self._record_browser_error('_auto_run_browser', reason='未找到或未能点击“全部运行”按钮')
                     return False
                 # 监听不阻塞监控主线程，认领回执到达或请求过期时停止。
                 self.try_authorize_drive()
                 return True
-        except Exception:
+        except Exception as exc:
+            self._record_browser_error('_auto_run_browser', exc=exc)
             return False
 
     @staticmethod
@@ -399,6 +443,7 @@ class ColabLauncher:
 
     def close_notebook_page(self, notebook_url=None) -> bool:
         """关闭已释放运行时的 Notebook 页面，保留一个 about:blank 标签页维持专用浏览器存活。"""
+        self.last_browser_error = None
         if not self.auto_run or not self.cdp_url:
             return False
         if not cdp_ready(self.cdp_url):
@@ -416,6 +461,10 @@ class ColabLauncher:
                     return True
                 for page in matches:
                     if self._connection_state(page) is True:
+                        self._record_browser_error(
+                            'close_notebook_page',
+                            reason='旧 Notebook 仍处于连接或运行状态，未关闭空闲页面',
+                        )
                         return False
                 self._close_related_popups(pages, set(matches))
                 remaining = [p for context in browser.contexts for p in context.pages
@@ -429,11 +478,13 @@ class ColabLauncher:
                         extra.close()
                     primary.goto('about:blank', wait_until='domcontentloaded', timeout=10000)
                 return True
-        except Exception:
+        except Exception as exc:
+            self._record_browser_error('close_notebook_page', exc=exc)
             return False
 
     def restore_notebook(self, notebook_url):
         """显示现有任务的原页面，只导航，绝不重放全部运行。"""
+        self.last_browser_error = None
         if not self.auto_run or not self.cdp_url:
             return False
         if self.browser_executable and not self._ensure_browser():
@@ -447,6 +498,7 @@ class ColabLauncher:
                 page = next((p for p in pages if normalize_notebook_url(p.url) == base), None)
                 if page is None:
                     if not browser.contexts:
+                        self._record_browser_error('restore_notebook', reason='专用浏览器未打开任何上下文')
                         return False
                     # 新启动的专用浏览器通常只有空白标签，直接复用。
                     page = next((p for p in pages if p.url == 'about:blank'), None)
@@ -456,8 +508,12 @@ class ColabLauncher:
                 page.get_by_role('button', name=RUN_ALL_BUTTON).first.wait_for(
                     state='visible', timeout=30000)
                 page.bring_to_front()
-                return normalize_notebook_url(page.url) == base
-        except Exception:
+                matched = normalize_notebook_url(page.url) == base
+                if not matched:
+                    self._record_browser_error('restore_notebook', reason='恢复后的页面地址与原 Notebook 不一致')
+                return matched
+        except Exception as exc:
+            self._record_browser_error('restore_notebook', exc=exc)
             return False
 
     @staticmethod
@@ -513,6 +569,7 @@ class ColabLauncher:
 
     def runtime_connection_state(self, notebook_url=None, *, reopen_missing=False):
         """返回 True=明确连接、False=明确未连接、None=无法判断。"""
+        self.last_browser_error = None
         if not self.auto_run or not self.cdp_url:
             return None
         if reopen_missing and self.browser_executable and not self._ensure_browser():
@@ -526,7 +583,11 @@ class ColabLauncher:
                 base = normalize_notebook_url(target)
                 matches = [p for p in pages if normalize_notebook_url(p.url) == base]
                 if not matches:
-                    if not reopen_missing or not browser.contexts:
+                    if not browser.contexts:
+                        self._record_browser_error('runtime_connection_state', reason='专用浏览器未打开任何上下文')
+                        return None
+                    if not reopen_missing:
+                        self._record_browser_error('runtime_connection_state', reason='专用浏览器中未找到对应 Notebook 标签页')
                         return None
                     # 关闭标签不代表运行时已释放；恢复时重开原地址，仅检查状态。
                     page = browser.contexts[0].new_page()
@@ -540,9 +601,14 @@ class ColabLauncher:
                     if all(state is False for state in states):
                         return False
                     if time.monotonic() >= deadline:
+                        self._record_browser_error(
+                            'runtime_connection_state',
+                            reason='检测 Notebook 运行时连接状态超时（15s），可能存在未登录、弹窗或加载阻塞',
+                        )
                         return None
                     matches[0].wait_for_timeout(250)
-        except Exception:
+        except Exception as exc:
+            self._record_browser_error('runtime_connection_state', exc=exc)
             return None
 
     @staticmethod
@@ -624,7 +690,10 @@ class TriggerMonitor:
             return
         if not state.triggered and not state.run_id:
             if state.status in {'unknown', 'offline'} and not state.close_page_at:
-                self.launcher.close_notebook_page(state.notebook_url or self.launcher.notebook_url)
+                closed = self.launcher.close_notebook_page(state.notebook_url or self.launcher.notebook_url)
+                detail = getattr(self.launcher, 'last_browser_error', None)
+                if not closed and isinstance(detail, str) and detail:
+                    return False
             return
         if (state.status not in {'opened', 'accepted', 'running', 'draining', 'needs_attention'}
                 or state.last_error in {'active_run_conflict', 'trigger_state_invalid', 'launch_state_unknown'}):
@@ -686,7 +755,12 @@ class TriggerMonitor:
         if connected is True:
             raise ValueError('恢复失败：旧 Notebook 仍连接，请先检查旧任务并断开运行时，再执行 --recover-expired。')
         if connected is not False:
-            raise ValueError('恢复失败：无法确认旧 Notebook 状态，请在专用浏览器检查原页面的登录、弹窗和连接状态，再执行 --recover-expired。')
+            detail = getattr(self.launcher, 'last_browser_error', None)
+            suffix = f'（详情：{detail}）' if isinstance(detail, str) and detail else ''
+            raise ValueError(
+                '恢复失败：无法确认旧 Notebook 状态，请在专用浏览器检查原页面的登录、弹窗和连接状态，再执行 --recover-expired。'
+                + suffix
+            )
         self.launcher.close()
         if self.launcher.authorization is not None:
             raise ValueError('恢复失败：旧授权监听尚未退出。')
@@ -734,7 +808,8 @@ class TriggerMonitor:
                     age = (stamp - datetime.fromisoformat(self.state.triggered_at)).total_seconds()
                     if age >= TRIGGER_CLAIM_SECONDS:
                         self.launcher.close()
-                        if self.state.last_error not in {'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}:
+                        if self.state.last_error not in {
+                                'launch_state_unknown', 'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}:
                             self.state.status, self.state.last_error = 'needs_attention', 'claim_timeout'
                     elif self.state.status in {'opened', 'needs_attention'} and self.state.last_error not in {
                             'launch_state_unknown', 'active_run_conflict', 'ack_invalid', 'trigger_state_invalid'}:
@@ -744,8 +819,14 @@ class TriggerMonitor:
                         auth = self.launcher.authorization
                         if auth is not None and auth.error:
                             self.state.status, self.state.last_error = 'needs_attention', auth.error
+                            if auth.error == 'authorization_browser_unavailable' and isinstance(self.launcher, ColabLauncher):
+                                detail = getattr(auth, 'last_error_detail', None)
+                                if isinstance(detail, str) and detail:
+                                    self.launcher.last_browser_error = detail
                         elif self.state.last_error and self.state.last_error.startswith(('google_', 'authorization_')):
                             self.state.status, self.state.last_error = 'opened', None
+                            if isinstance(self.launcher, ColabLauncher):
+                                self.launcher.last_browser_error = None
                 except ValueError:
                     self.state.status, self.state.last_error = 'needs_attention', 'trigger_state_invalid'
             self.state.save(self.state_file)
@@ -768,7 +849,11 @@ class TriggerMonitor:
                 self.state.save(self.state_file)
                 try:
                     launch_url = self.launcher.launch(self.room_url, run_id, stamp.isoformat())
-                except Exception:
+                except Exception as exc:
+                    if (isinstance(self.launcher, ColabLauncher)
+                            and not self.launcher.last_browser_error
+                            and str(exc) != 'browser_auto_run_needs_attention'):
+                        self.launcher._record_browser_error('launch', exc=exc)
                     self.state.status, self.state.last_error = 'needs_attention', 'launch_state_unknown'
                     self.state.save(self.state_file)
                     return TriggerResult('needs_attention', run_id=run_id, error=self.state.last_error)

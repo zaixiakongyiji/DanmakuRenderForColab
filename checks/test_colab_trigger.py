@@ -6,8 +6,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+from colab_support.drive_authorization import format_browser_exception
 from colab_support.trigger import (ColabLauncher, TriggerMonitor, TRIGGER_SCHEMA_VERSION,
-    claim_request, control_paths, validate_room_url, validate_trigger_request, write_ack)
+    check_playwright_loopback, claim_request, control_paths, validate_room_url,
+    validate_trigger_request, write_ack)
 from colab_support.locks import ProcessLock
 from colab_support.notebook_session import prepare_session
 
@@ -479,6 +481,144 @@ class TriggerTests(unittest.TestCase):
         self.assertTrue(res_open.triggered)
         self.assertIsNone(res_open.error)
         self.assertIsNone(self.monitor.state.last_error)
+
+    def test_loopback_interception_check_and_sanitized_browser_error(self):
+        import sys
+        import colab_monitor
+        import colab_trigger
+
+        check_playwright_loopback()
+        with patch('colab_support.trigger.socket.socketpair',
+                   side_effect=ConnectionError('Unexpected peer connection')):
+            with self.assertRaisesRegex(ValueError, 'Unexpected peer connection.*Proxifier'):
+                check_playwright_loopback()
+            with patch('colab_monitor.importlib.util.find_spec', return_value=object()), \
+                    self.assertRaisesRegex(ValueError, '127\\.0\\.0\\.1'):
+                colab_monitor.main([])
+            with patch.object(sys, 'argv', [
+                'colab_trigger.py', '--url', 'https://live.bilibili.com/1',
+                '--drive-sync-root', str(self.root), '--auto-run', '--cdp-url', 'http://127.0.0.1:9222',
+            ]), self.assertRaisesRegex(ValueError, 'Unexpected peer connection'):
+                colab_trigger.main()
+
+        raw = RuntimeError(
+            r'goto failed at https://colab.research.google.com/drive/secret-id from C:\Users\alice\drive'
+        )
+        formatted = format_browser_exception(raw)
+        self.assertIn('<url>', formatted)
+        self.assertIn('<path>', formatted)
+        self.assertNotIn('secret-id', formatted)
+        self.assertNotIn('alice', formatted)
+
+        wrapped = RuntimeError('playwright failed')
+        wrapped.__cause__ = ConnectionError('Unexpected peer connection')
+        self.assertIn('Unexpected peer connection', format_browser_exception(wrapped))
+        self.assertIn('Handle Direct Connections', format_browser_exception(wrapped))
+
+    def test_launch_state_unknown_preserves_root_error_past_claim_timeout(self):
+        import io
+        import logging
+        import sys
+        from contextlib import redirect_stdout
+        import colab_trigger
+
+        launcher = ColabLauncher('https://colab.test/notebook', self.root,
+                                 auto_run=True, cdp_url='http://127.0.0.1:9222')
+        monitor = TriggerMonitor('https://live.bilibili.com/1', launcher,
+                                 self.root / 'auto_state.json', live_confirmations=1,
+                                 offline_confirmations=2, now=lambda: self.clock)
+        manager = MagicMock()
+        manager.__enter__.side_effect = ConnectionError('Unexpected peer connection')
+        api = MagicMock(sync_playwright=MagicMock(return_value=manager))
+        with patch.dict(sys.modules, {'playwright.sync_api': api}):
+            res = monitor.observe(True)
+
+        self.assertEqual(res.state, 'needs_attention')
+        self.assertEqual(res.error, 'launch_state_unknown')
+        self.assertIn('Unexpected peer connection', launcher.last_browser_error or '')
+
+        self.clock += 901
+        res_after = monitor.observe(True)
+        self.assertEqual(res_after.error, 'launch_state_unknown')
+        self.assertEqual(monitor.state.last_error, 'launch_state_unknown')
+
+        level, msg = colab_trigger.format_trigger_message(
+            '舍茶建乡', res_after, detail=launcher.last_browser_error,
+        )
+        self.assertEqual(level, logging.WARNING)
+        self.assertIn('Colab 启动状态未知', msg)
+        self.assertIn('--recover-expired', msg)
+        self.assertIn('Unexpected peer connection', msg)
+
+        args = colab_trigger.parser().parse_args([
+            '--url', 'https://live.bilibili.com/1', '--json', '--once', '--auto-run',
+        ])
+        fake_monitor = Mock()
+        fake_monitor.return_value.state.ack_status = None
+        fake_monitor.return_value.resume_pending.return_value = None
+        fake_monitor.return_value.observe.return_value = res_after
+        output = io.StringIO()
+        with redirect_stdout(output), \
+                patch.object(colab_trigger, 'TriggerMonitor', fake_monitor), \
+                patch.object(colab_trigger, 'probe_bilibili', return_value=True), \
+                patch.object(colab_trigger, 'resolve_target_info', return_value=('舍茶建乡', '1')), \
+                patch.object(colab_trigger, 'setup_logger', return_value=Mock()):
+            self.assertEqual(colab_trigger.monitor_loop(args, args.url, launcher), 1)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        payload = json.loads(lines[0])
+        self.assertEqual(payload['error'], 'launch_state_unknown')
+        self.assertIn('Unexpected peer connection', payload['detail'])
+
+    def test_resume_pending_idle_close_failure_logs_distinct_warning(self):
+        import io
+        import sys
+        from contextlib import redirect_stdout
+        import colab_trigger
+
+        launcher = ColabLauncher('https://colab.test/notebook', self.root,
+                                 auto_run=True, cdp_url='http://127.0.0.1:9222')
+        monitor = TriggerMonitor('https://live.bilibili.com/1', launcher,
+                                 self.root / 'idle_state.json', live_confirmations=1,
+                                 offline_confirmations=2, now=lambda: self.clock)
+        manager = MagicMock()
+        manager.__enter__.side_effect = ConnectionError('Unexpected peer connection')
+        api = MagicMock(sync_playwright=MagicMock(return_value=manager))
+        with patch.dict(sys.modules, {'playwright.sync_api': api}), \
+                patch('colab_support.trigger.cdp_ready', return_value=True):
+            self.assertFalse(monitor.resume_pending())
+        self.assertIn('Unexpected peer connection', launcher.last_browser_error or '')
+
+        mock_logger = Mock()
+        args = colab_trigger.parser().parse_args([
+            '--url', 'https://live.bilibili.com/1', '--once',
+        ])
+        fake_monitor = Mock(state=monitor.state)
+        fake_monitor.resume_pending.return_value = False
+        fake_monitor.observe.return_value = colab_trigger.TriggerResult('opened', triggered=True, run_id='run-1')
+        with patch.object(colab_trigger, 'TriggerMonitor', return_value=fake_monitor), \
+                patch.object(colab_trigger, 'probe_bilibili', return_value=True), \
+                patch.object(colab_trigger, 'resolve_target_info', return_value=('舍茶建乡', '1')), \
+                patch.object(colab_trigger, 'setup_logger', return_value=mock_logger):
+            self.assertEqual(colab_trigger.monitor_loop(args, args.url, launcher), 0)
+        warning_text = mock_logger.warning.call_args.args[0]
+        self.assertIn('遗留 Notebook 页面', warning_text)
+        self.assertNotIn('原 Notebook 页面未能显示', warning_text)
+        self.assertIn('Unexpected peer connection', warning_text)
+
+        args_json = colab_trigger.parser().parse_args([
+            '--url', 'https://live.bilibili.com/1', '--once', '--json',
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output), \
+                patch.object(colab_trigger, 'TriggerMonitor', return_value=fake_monitor), \
+                patch.object(colab_trigger, 'probe_bilibili', return_value=True), \
+                patch.object(colab_trigger, 'resolve_target_info', return_value=('舍茶建乡', '1')), \
+                patch.object(colab_trigger, 'setup_logger', return_value=Mock()):
+            self.assertEqual(colab_trigger.monitor_loop(args_json, args_json.url, launcher), 0)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[0]['event'], 'idle_notebook_close_failed')
+        self.assertIn('Unexpected peer connection', events[0]['detail'])
 
 
 if __name__ == '__main__':
