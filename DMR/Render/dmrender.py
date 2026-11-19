@@ -66,7 +66,8 @@ class DmRender(BaseRender):
         
         ffmpeg_args += [
             '-fflags', '+discardcorrupt+genpts',
-            '-analyzeduration', '2147483647', '-probesize', '2147483647',
+            '-analyzeduration', str(self.advanced_render_args.get('analyzeduration', 15000000)),
+            '-probesize', str(self.advanced_render_args.get('probesize', 50000000)),
             '-i', video,
             filter_name, filter_str,
 

@@ -46,7 +46,6 @@ class AssWriter():
         self.kwargs = kwargs
 
         self._lock = threading.Lock()
-        self._super_chat_tails = []  # 初始化 _super_chat_tails 属性
         self._super_chat_state = 0
         self._latest_end_time = 0
         self._ntracks = int(((self.height - self.dst) * self.dmrate) / (self.fontsize + self.margin_h))
@@ -82,6 +81,8 @@ class AssWriter():
         with self._lock, open(filename,'w',encoding='utf-8') as f:
             self._filename = filename
             self._track_tails = [None for _ in range(self._ntracks)]
+            self._super_chat_state = 0
+            self._latest_end_time = 0
             for info in self.meta_info:
                 f.write(info+'\n')
 
@@ -194,7 +195,6 @@ class AssWriter():
             with open(self._filename, 'a', encoding='utf-8') as f:
                 f.write(dm_info)
 
-            self._super_chat_tails.append(super_chat)
 
     def close(self):
         del self._filename

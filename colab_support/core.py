@@ -127,6 +127,7 @@ class Coordinator:
         self.producer_done = False
         self.pending_render = {}
         self.pending_backup = {}
+        self._checkpoint_dirty = False
         self.sequence = 0
         self.require_merge = require_merge
         self.post_submit = post_submit
@@ -144,6 +145,11 @@ class Coordinator:
         if code not in self.manifest['errors']:
             self.manifest['errors'].append(code)
 
+    @staticmethod
+    def _count_dialogues(path):
+        with path.open(encoding='utf-8-sig') as stream:
+            return sum(line.startswith('Dialogue:') for line in stream)
+
     def _backup(self, key, kind, path):
         job_id = uuid.uuid4().hex
         destination = self.backup_dir / kind / (key + Path(path).suffix)
@@ -153,6 +159,11 @@ class Coordinator:
 
     def checkpoint(self):
         atomic_json(self.run_dir / 'manifest.json', self.manifest)
+        # 慢 Drive 下只保留一份待确认快照；确认后再发送期间累积的最新状态。
+        if (None, 'checkpoint') in self.pending_backup.values():
+            self._checkpoint_dirty = True
+            return
+        self._checkpoint_dirty = False
         self.sequence += 1
         job_id = 'checkpoint-' + str(self.sequence)
         self.pending_backup[job_id] = (None, 'checkpoint')
@@ -187,7 +198,7 @@ class Coordinator:
                     'streamer': {k: v for k, v in (data.get('streamer') or {}).items() if k in ('name', 'url')},
                     'group_id': data['group_id'],
                     'segment_id': data['segment_id'],
-                    'danmaku_dialogues': sum(line.startswith('Dialogue:') for line in ass.read_text(encoding='utf-8-sig').splitlines())}
+                    'danmaku_dialogues': self._count_dialogues(ass)}
                 self._backup(key, 'source', video)
                 self._backup(key, 'danmaku', ass)
                 rid = uuid.uuid4().hex
@@ -272,8 +283,10 @@ class Coordinator:
                 self.checkpoint()
                 return
             if key is None:
-                # 确认检查点不能再次生成检查点，避免无限任务链。
                 atomic_json(self.run_dir / 'manifest.json', self.manifest)
+                # 只有实际发生了新变化才补发，不能由确认自身形成无限任务链。
+                if kind == 'checkpoint' and self._checkpoint_dirty:
+                    self.checkpoint()
                 return
             self.manifest['segments'][key]['backup'][kind] = dict(
                 data, status='success' if event == 'end' else 'error')

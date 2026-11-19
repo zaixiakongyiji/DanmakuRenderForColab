@@ -11,6 +11,7 @@ import tempfile
 import time
 from DMR.utils import *
 from DMR.LiveAPI import Onair
+from DMR.utils.process import read_log_tail
 
 
 class StreamgearsDownloader():
@@ -60,13 +61,13 @@ class StreamgearsDownloader():
         self.logger.debug(f'Stream-gears downloader args: {streamgears_args}')
 
         if self.debug:
-            self.streamgears_proc = subprocess.Popen(streamgears_args, stdin=subprocess.PIPE, stdout=sys.stdout, stderr=subprocess.STDOUT, bufsize=10**8)
+            self.streamgears_proc = subprocess.Popen(streamgears_args, stdin=subprocess.PIPE, stdout=sys.stdout, stderr=subprocess.STDOUT, bufsize=-1)
             self.streamgears_proc.wait()
             return
 
         with tempfile.TemporaryFile(dir='.temp') as logfile:
         # with open('.temp/test.log', 'wb') as logfile:
-            self.streamgears_proc = subprocess.Popen(streamgears_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT, bufsize=10**8)
+            self.streamgears_proc = subprocess.Popen(streamgears_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT, bufsize=-1)
             while not self.stoped:
                 if self.streamgears_proc.poll() is not None:
                     break
@@ -78,8 +79,7 @@ class StreamgearsDownloader():
                 time.sleep(10)
             
             if not self.stoped and Onair(self.url):
-                logfile.seek(0)
-                log = logfile.read().decode('utf8', errors='ignore')
+                log = read_log_tail(logfile)
                 raise RuntimeError(f'{self.taskname} Stream-gears 异常退出 {log[-1000:]}.')
 
     def start(self):

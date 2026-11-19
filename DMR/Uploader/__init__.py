@@ -33,6 +33,7 @@ class Uploader():
         
         self.upload_executors = ThreadPoolExecutor(max_workers=self.nuploaders)
         self._lock = threading.Lock()
+        self._closing = False
 
     def load_failed_tasks(self):
         if exists(self.failed_tasks_file):
@@ -64,6 +65,8 @@ class Uploader():
 
     def retry_task(self, uuid):
         with self._lock:
+            if self._closing:
+                return False
             if uuid in self.failed_tasks:
                 task = self.failed_tasks.pop(uuid)
                 self.save_failed_tasks()
@@ -103,6 +106,8 @@ class Uploader():
     def _pipeRecvMonitor(self):
         while self.stoped == False and self.recv_queue is not None:
             message:PipeMessage = self.recv_queue.get()
+            if message is None:
+                break
             try:
                 if message.target == 'uploader':
                     if message.event == 'newtask':
@@ -112,6 +117,10 @@ class Uploader():
                 self.logger.exception(e)
 
     def start(self):
+        if self._closing:
+            raise RuntimeError('Uploader has been stopped.')
+        if self._piperecvprocess is not None and self._piperecvprocess.is_alive():
+            return
         self.stoped = False
         self._piperecvprocess = threading.Thread(target=self._pipeRecvMonitor, daemon=True)
         self._piperecvprocess.start()
@@ -127,6 +136,8 @@ class Uploader():
 
     def add_task(self, msg:PipeMessage):
         with self._lock:
+            if self._closing:
+                raise RuntimeError('Uploader has been stopped.')
             config = msg.data
             file = config.get('files')[0]
             stream_queue = None
@@ -190,6 +201,8 @@ class Uploader():
             upload_group:str = task['upload_group']
 
             with self._lock:
+                if self._closing:
+                    return
                 if upload_group in self._uploader_pool:
                     target_uploader = self._uploader_pool[upload_group]['class']
                     self._uploader_pool[upload_group]['ctime'] = time.time()
@@ -265,10 +278,20 @@ class Uploader():
             self._gather(task, 'error', desc=e)
 
     def stop(self):
-        self.stoped = True
-        self.upload_executors.shutdown(wait=False)
-        for upload_group in self._uploader_pool:
-            self._uploader_pool[upload_group]['class'].stop()
+        with self._lock:
+            self._closing = True
+            self.stoped = True
+            active = [item['class'] for item in self._uploader_pool.values()]
+        self.recv_queue.put(None)
+        monitor = self._piperecvprocess
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=5)
+        self.upload_executors.shutdown(wait=False, cancel_futures=True)
+        for uploader in active:
+            try:
+                uploader.stop()
+            except Exception:
+                self.logger.exception('Failed to stop uploader.')
         
         with self._lock:
             for uuid, task in self.upload_tasks.items():

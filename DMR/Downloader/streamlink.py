@@ -11,6 +11,7 @@ import time
 
 from DMR.utils import *
 from DMR.LiveAPI import Onair
+from DMR.utils.process import iter_process_log, read_log_tail
 
 
 class StreamlinkDownloader():
@@ -73,17 +74,15 @@ class StreamlinkDownloader():
             streamlink_ok = False
             for _ in range(60):
                 try:
-                    logfile.seek(0)
-                    stdout = logfile.read().decode('utf8', errors='ignore')
-                    if re.findall(r'http://\d+\.\d+\.\d+\.\d+:'+str(port), stdout):
+                    pattern = r'http://\d+\.\d+\.\d+\.\d+:'+str(port)
+                    if any(re.search(pattern, line) for line in iter_process_log(logfile)):
                         streamlink_ok = True
                         break
                 except Exception as e:
                     pass
                 time.sleep(1)
             if not streamlink_ok:
-                logfile.seek(0)
-                log = logfile.read().decode('utf8', errors='ignore')
+                log = read_log_tail(logfile)
                 raise RuntimeError(f'{self.taskname} Streamlink启动失败: {log}')
             
             self.ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT)
@@ -106,8 +105,7 @@ class StreamlinkDownloader():
                 time.sleep(10)
             
             if not self.stoped and Onair(self.url):
-                logfile.seek(0)
-                log = logfile.read().decode('utf8', errors='ignore')
+                log = read_log_tail(logfile)
                 raise RuntimeError(f'{self.taskname} Streamlink 异常退出 {log[-1000:]}.')
 
     def start(self):

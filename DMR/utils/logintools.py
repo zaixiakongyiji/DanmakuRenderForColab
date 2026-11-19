@@ -6,7 +6,7 @@ __all__ = ['bili_islogin', 'bili_login']
 
 def bili_islogin(cookies_path:str, **kwargs) -> bool:
     renew_args = [ToolsList.get('biliup'), '-u', cookies_path, 'renew']
-    proc = subprocess.Popen(renew_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=10**8)
+    proc = subprocess.Popen(renew_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=-1)
     proc.wait()
     out = proc.stdout.read()
     out = out.decode('utf-8')
@@ -33,4 +33,3 @@ def bili_login(cookies:str, account:str=None, **kwargs):
         proc.wait()
     # print(f'将 {account} 的登录信息保存到 {cookies}.')
     return cookies
-    

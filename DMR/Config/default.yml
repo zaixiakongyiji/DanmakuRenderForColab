@@ -242,6 +242,9 @@ render_args:
     # 高级渲染参数
     # 请确保你明白这些参数的含义后再修改
     advanced_render_args:
+      # 输入探测上限：字节数与时长（微秒）；异常媒体可按需调大
+      probesize: 50000000
+      analyzeduration: 15000000
       # 直接定义video filter，这里的{DANMAKU}代表弹幕文件路径
       # 注意设置filter_complex之后将会禁用fps等其他有关filter的选项
       filter_complex: subtitles=filename='{DANMAKU}'

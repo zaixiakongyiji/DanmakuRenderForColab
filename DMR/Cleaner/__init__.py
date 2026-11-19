@@ -23,6 +23,8 @@ class Cleaner():
         self._piperecvprocess = None
         self.clean_executors = ThreadPoolExecutor(max_workers=1)
         self._lock = threading.Lock()
+        self._closing = False
+        self._timers = set()
     
     def _pipeSend(self, event, msg, target='engine', request_id=None, dtype=None, data=None, **kwargs):
         if self.send_queue:
@@ -41,6 +43,8 @@ class Cleaner():
     def _pipeRecvMonitor(self):
         while self.stoped == False and self.recv_queue is not None:
             message:PipeMessage = self.recv_queue.get()
+            if message is None:
+                break
             try:
                 if message.target == 'cleaner':
                    if message.event == 'newtask':
@@ -50,12 +54,18 @@ class Cleaner():
                 self.logger.exception(e)
 
     def start(self):
+        if self._closing:
+            raise RuntimeError('Cleaner has been stopped.')
+        if self._piperecvprocess is not None and self._piperecvprocess.is_alive():
+            return
         self.stoped = False
         self._piperecvprocess = threading.Thread(target=self._pipeRecvMonitor, daemon=True)
         self._piperecvprocess.start()
 
     def add_task(self, msg:PipeMessage):
         with self._lock:
+            if self._closing:
+                raise RuntimeError('Cleaner has been stopped.')
             config = msg.data
             method = config.get('method')
             if not method: return 
@@ -69,8 +79,17 @@ class Cleaner():
                 'config': config,
             }
             if config.get('delay', 0) > 0:
-                threading.Timer(config.get('delay'), self.clean_executors.submit, args=(self._clean_subprocess, task)).start()
+                timer = threading.Timer(config['delay'], self._submit_delayed, args=(task,))
+                timer.daemon = True
+                self._timers.add(timer)
+                timer.start()
             else:
+                self.clean_executors.submit(self._clean_subprocess, task)
+
+    def _submit_delayed(self, task):
+        with self._lock:
+            self._timers.discard(threading.current_thread())
+            if not self._closing:
                 self.clean_executors.submit(self._clean_subprocess, task)
 
     def _clean_subprocess(self, task):
@@ -124,4 +143,18 @@ class Cleaner():
             self._pipeSend('error', f'清理错误 {e}.', target=task['source'], request_id=task['request_id'], dtype='Exception', data=e)
             
     def stop(self):
-        self.stoped = True
+        with self._lock:
+            self._closing = True
+            self.stoped = True
+            timers = list(self._timers)
+            self._timers.clear()
+        for timer in timers:
+            timer.cancel()
+        for timer in timers:
+            if timer is not threading.current_thread():
+                timer.join(timeout=5)
+        self.recv_queue.put(None)
+        monitor = self._piperecvprocess
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=5)
+        self.clean_executors.shutdown(wait=False, cancel_futures=True)

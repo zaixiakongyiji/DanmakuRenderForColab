@@ -9,6 +9,7 @@ import time
 import subprocess
 
 from DMR.utils import replace_keywords, ToolsList, VideoInfo
+from DMR.utils.process import LOG_TAIL_BYTES, iter_process_log
 
 
 class biliuprs():
@@ -106,9 +107,9 @@ class biliuprs():
             logfile = sys.stdout
 
         if self.debug:
-            upload_proc = subprocess.Popen(upload_args, stdin=subprocess.PIPE, stdout=sys.stdout, stderr=subprocess.STDOUT, bufsize=10**8)
+            upload_proc = subprocess.Popen(upload_args, stdin=subprocess.PIPE, stdout=sys.stdout, stderr=subprocess.STDOUT, bufsize=-1)
         else:
-            upload_proc = subprocess.Popen(upload_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT, bufsize=10**8)
+            upload_proc = subprocess.Popen(upload_args, stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT, bufsize=-1)
         
         try:
             self._upload_procs[upload_proc.pid] = upload_proc
@@ -126,7 +127,7 @@ class biliuprs():
     
     def islogin(self):
         renew_args = self.base_args + ['renew']
-        proc = subprocess.Popen(renew_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=10**8)
+        proc = subprocess.Popen(renew_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=-1)
         out = proc.stdout.read()
         out = out.decode('utf-8')
 
@@ -156,10 +157,8 @@ class biliuprs():
         
             out_bvid = None
             log = ''
-            logfile.seek(0)
-            for line in logfile.readlines():
-                line = line.decode('utf-8', errors='ignore').strip()
-                log += line+'\n'
+            for line in iter_process_log(logfile):
+                log = (log + line+'\n')[-LOG_TAIL_BYTES:]
                 if '\"bvid\"' in line:
                     res = re.search(r'(BV[0-9A-Za-z]{10})', line)
                     if res:  out_bvid = res[0]

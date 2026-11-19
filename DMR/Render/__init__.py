@@ -33,6 +33,7 @@ class Render():
         self._render_class = {}
         self.render_executors = ThreadPoolExecutor(max_workers=self.nrenders)
         self._lock = threading.Lock()
+        self._closing = False
 
     def load_failed_tasks(self):
         if exists(self.failed_tasks_file):
@@ -59,6 +60,8 @@ class Render():
 
     def retry_task(self, uuid):
         with self._lock:
+            if self._closing:
+                return False
             if uuid in self.failed_tasks:
                 task = self.failed_tasks.pop(uuid)
                 self.save_failed_tasks()
@@ -94,6 +97,8 @@ class Render():
     def _pipeRecvMonitor(self):
         while self.stoped == False and self.recv_queue is not None:
             message:PipeMessage = self.recv_queue.get()
+            if message is None:
+                break
             try:
                 if message.target == 'render':
                    if message.event == 'newtask':
@@ -103,12 +108,18 @@ class Render():
                 self.logger.exception(e)
     
     def start(self):
+        if self._closing:
+            raise RuntimeError('Render has been stopped.')
+        if self._piperecvprocess is not None and self._piperecvprocess.is_alive():
+            return
         self.stoped = False
         self._piperecvprocess = threading.Thread(target=self._pipeRecvMonitor, daemon=True)
         self._piperecvprocess.start()
 
     def add_task(self, msg:PipeMessage):
         with self._lock:
+            if self._closing:
+                raise RuntimeError('Render has been stopped.')
             config = msg.data
             source = msg.source
             request_id = msg.request_id
@@ -155,7 +166,11 @@ class Render():
                 )
 
     def _render_subprocess(self, task):
+        with self._lock:
+            if self._closing:
+                return
         task['status'] = 'rendering'
+        target_render = None
         try:
             render_args = task['args']
             mode:str = task['mode']
@@ -174,25 +189,46 @@ class Render():
             self.logger.info(f'正在渲染: {video.path}')
             os.makedirs(os.path.dirname(output), exist_ok=True)
 
-            self._render_class[task['uuid']] = target_render
+            with self._lock:
+                if self._closing:
+                    return
+                self._render_class[task['uuid']] = target_render
             status, info = target_render.render_one(video=video, output=output)
-            self._render_class.pop(task['uuid'])
 
             if status:
                 self._gather(task, 'info', desc=info)
             else:
                 self._gather(task, 'error', desc=info)
         except KeyboardInterrupt:
-            target_render.stop()
+            if target_render is not None:
+                target_render.stop()
         except Exception as e:
             self.logger.exception(e)
+            if target_render is not None:
+                try:
+                    target_render.stop()
+                except Exception:
+                    self.logger.exception('Failed to stop render after error.')
             self._gather(task, 'error', desc=e)
+        finally:
+            with self._lock:
+                self._render_class.pop(task['uuid'], None)
 
     def stop(self):
-        self.stoped = True
-        for uuid, render in self._render_class.items():
-            render.stop()
-        self.render_executors.shutdown(wait=False)
+        with self._lock:
+            self._closing = True
+            self.stoped = True
+            active = list(self._render_class.values())
+        self.recv_queue.put(None)
+        monitor = self._piperecvprocess
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=5)
+        self.render_executors.shutdown(wait=False, cancel_futures=True)
+        for render in active:
+            try:
+                render.stop()
+            except Exception:
+                self.logger.exception('Failed to stop render.')
         
         with self._lock:
             for uuid, task in self.render_tasks.items():
